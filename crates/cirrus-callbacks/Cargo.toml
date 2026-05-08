@@ -8,7 +8,7 @@ description = "Document sinks: JSONL, table, etc."
 [features]
 default = []
 zmq = ["dep:zmq", "dep:rmp-serde"]
-tiled = ["dep:reqwest"]
+tiled = ["dep:tiled-client", "dep:url"]
 
 [dependencies]
 async-trait.workspace = true
@@ -20,9 +20,10 @@ cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-engine.workspace = true
 
-zmq        = { version = "0.10", optional = true }
-rmp-serde  = { version = "1", optional = true }
-reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+zmq          = { version = "0.10", optional = true }
+rmp-serde    = { version = "1", optional = true }
+tiled-client = { path = "../../../tiled-rs/crates/tiled-client", optional = true }
+url          = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
