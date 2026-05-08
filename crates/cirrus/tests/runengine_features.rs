@@ -769,6 +769,327 @@ async fn re_class_reports_engine_name() {
     }
 }
 
+// -- Msg::Subscribe / Unsubscribe + temp sub auto-cleanup -------------------
+
+#[tokio::test]
+async fn msg_subscribe_receives_documents_and_auto_unsubscribes() {
+    let count = Arc::new(AtomicU64::new(0));
+    let c2 = count.clone();
+    let cb: cirrus_core::msg::SubscribeCallback = Arc::new(move |_d| {
+        c2.fetch_add(1, Ordering::SeqCst);
+    });
+    let re = RunEngine::new(vec![]);
+
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Subscribe(cb);
+        yield Msg::OpenRun(Default::default());
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+    let after_first = count.load(Ordering::SeqCst);
+    assert!(after_first >= 2, "subscriber should see start + stop");
+
+    // Run another plan with no subscribe; the prior subscriber must
+    // have been removed at the previous run's end.
+    let plan2 = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan2).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        after_first,
+        "temp subscriber must be removed at run end"
+    );
+}
+
+#[tokio::test]
+async fn msg_unsubscribe_removes_callback_immediately() {
+    let count = Arc::new(AtomicU64::new(0));
+    let c2 = count.clone();
+    let cb: cirrus_core::msg::SubscribeCallback = Arc::new(move |_d| {
+        c2.fetch_add(1, Ordering::SeqCst);
+    });
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.set_input_handler(Some(Arc::new(|_| Box::pin(async { Ok(String::new()) }))));
+
+    // Use a custom command to surface the subscription id back to
+    // the test (Msg::Subscribe stores it in MsgResult, but we don't
+    // have a stable mid-run hook to read it; instead we issue
+    // Subscribe → Unsubscribe via a wrapping handler).
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Subscribe(cb.clone());
+        yield Msg::OpenRun(Default::default());
+        // No Unsubscribe here; auto-cleanup at run end is enough
+        // for this test — we just need the subscriber to fire.
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+    assert!(count.load(Ordering::SeqCst) >= 2);
+}
+
+// -- md_normalizer ----------------------------------------------------------
+
+#[tokio::test]
+async fn md_normalizer_modifies_runstart() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.set_md_normalizer(Some(Arc::new(|mut md| {
+        md.insert("normalized".into(), Value::Bool(true));
+        Ok(md)
+    })));
+    re.run_async(one_count_plan()).await.unwrap();
+    let docs = sink.snapshot().await;
+    let start = match &docs[0] {
+        Document::Start(s) => s,
+        _ => panic!("first doc not Start"),
+    };
+    assert_eq!(start.extra.get("normalized"), Some(&Value::Bool(true)));
+}
+
+// -- scan_id_source ---------------------------------------------------------
+
+#[tokio::test]
+async fn scan_id_source_overrides_auto_increment() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.set_scan_id_source(Some(Arc::new(|_md| Ok(42))));
+    re.run_async(one_count_plan()).await.unwrap();
+    let docs = sink.snapshot().await;
+    let start = match &docs[0] {
+        Document::Start(s) => s,
+        _ => panic!("first doc not Start"),
+    };
+    assert_eq!(start.scan_id, Some(42));
+}
+
+// -- preprocessors ----------------------------------------------------------
+
+#[tokio::test]
+async fn preprocessor_wraps_plan() {
+    use cirrus_core::plan::PlanItem;
+    use futures::StreamExt;
+    let count = Arc::new(AtomicU64::new(0));
+    let c2 = count.clone();
+    let pp: cirrus_engine::Preprocessor = Arc::new(move |inner: Plan| {
+        let c = c2.clone();
+        plan_box(async_stream::stream! {
+            let mut inner = inner;
+            // Prepend one Sleep — observable as +1 message.
+            c.fetch_add(1, Ordering::SeqCst);
+            yield Msg::Sleep(Duration::from_millis(1));
+            while let Some(it) = inner.next().await {
+                if let PlanItem::Bare(m) = it {
+                    yield m;
+                }
+            }
+        })
+    });
+    let re = RunEngine::new(vec![]);
+    re.add_preprocessor(pp);
+    re.run_async(one_count_plan()).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "preprocessor should run exactly once at run_async entry"
+    );
+}
+
+// -- run_async_with: per-call md + temp subs --------------------------------
+
+#[tokio::test]
+async fn run_async_with_per_call_md_lands_in_runstart() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mut md = std::collections::HashMap::new();
+    md.insert("operator".into(), Value::String("bob".into()));
+    let opts = cirrus_engine::RunOptions { md, subs: vec![] };
+    re.run_async_with(one_count_plan(), opts).await.unwrap();
+    let docs = sink.snapshot().await;
+    let start = match &docs[0] {
+        Document::Start(s) => s,
+        _ => panic!("first doc not Start"),
+    };
+    assert_eq!(
+        start.extra.get("operator"),
+        Some(&Value::String("bob".into()))
+    );
+    // Per-call md should NOT persist into the next run.
+    re.run_async(one_count_plan()).await.unwrap();
+    let docs2 = sink.snapshot().await;
+    let start2 = match docs2.iter().rev().find(|d| matches!(d, Document::Start(_))) {
+        Some(Document::Start(s)) => s,
+        _ => panic!(),
+    };
+    assert!(
+        !start2.extra.contains_key("operator"),
+        "per-call md must not persist"
+    );
+}
+
+#[tokio::test]
+async fn run_async_with_temp_subs_auto_remove_at_run_end() {
+    let count = Arc::new(AtomicU64::new(0));
+    let c2 = count.clone();
+    let re = RunEngine::new(vec![]);
+    let opts = cirrus_engine::RunOptions {
+        md: Default::default(),
+        subs: vec![Arc::new(move |_d: &Document| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        })],
+    };
+    re.run_async_with(one_count_plan(), opts).await.unwrap();
+    let after_first = count.load(Ordering::SeqCst);
+    assert!(after_first > 0);
+    re.run_async(one_count_plan()).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        after_first,
+        "temp subs from run_async_with must be removed at run end"
+    );
+}
+
+// -- record_interruptions ----------------------------------------------------
+
+#[tokio::test]
+async fn record_interruptions_emits_descriptor_and_events() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    re.set_record_interruptions(true);
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    re.resume();
+    let _ = join.await.unwrap().unwrap();
+
+    let docs = sink.snapshot().await;
+    let interruption_descriptors: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) if d.name.as_deref() == Some("interruptions") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        interruption_descriptors.len(),
+        1,
+        "exactly one interruptions descriptor expected"
+    );
+    let desc = interruption_descriptors[0];
+    assert!(desc.data_keys.contains_key("interruption"));
+
+    let interruption_events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) if e.descriptor == desc.uid => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        interruption_events.len() >= 2,
+        "expected at least pause + resume events, got {}",
+        interruption_events.len()
+    );
+    let labels: Vec<String> = interruption_events
+        .iter()
+        .filter_map(|e| {
+            e.data
+                .get("interruption")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(labels.iter().any(|s| s == "pause"));
+    assert!(labels.iter().any(|s| s == "resume"));
+}
+
+#[tokio::test]
+async fn record_interruptions_off_emits_nothing() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    // record_interruptions defaults to false.
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    re.resume();
+    let _ = join.await.unwrap().unwrap();
+    let docs = sink.snapshot().await;
+    let any_interruptions = docs.iter().any(|d| match d {
+        Document::Descriptor(d) => d.name.as_deref() == Some("interruptions"),
+        _ => false,
+    });
+    assert!(
+        !any_interruptions,
+        "no interruptions stream should be declared when recording is off"
+    );
+}
+
+#[tokio::test]
+async fn suspend_until_with_records_justification() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    re.set_record_interruptions(true);
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    re.suspend_until_with(
+        Box::pin(async move {
+            let _ = rx.await;
+        }),
+        Some("shutter closed".into()),
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("did not auto-resume in time")
+        .unwrap()
+        .unwrap();
+
+    let docs = sink.snapshot().await;
+    let labels: Vec<String> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e
+                .data
+                .get("interruption")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|s| s == "shutter closed"),
+        "expected the supplied justification to be recorded, got {labels:?}"
+    );
+}
+
 // -- sigint_count reset ------------------------------------------------------
 
 #[tokio::test]

@@ -1001,6 +1001,7 @@ fn msg_result_to_lua(lua: &Lua, r: cirrus_engine::MsgResult) -> LuaValue {
             .create_string(name)
             .map(LuaValue::String)
             .unwrap_or(LuaValue::Nil),
+        MsgResult::SubscriptionId { id } => LuaValue::Integer(id as i64),
     }
 }
 

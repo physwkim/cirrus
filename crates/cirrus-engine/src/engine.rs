@@ -76,6 +76,23 @@ pub type CustomCommandHandler = Arc<
 /// reject the run.
 pub type MdValidator = Arc<dyn Fn(&HashMap<String, Value>) -> Result<()> + Send + Sync + 'static>;
 
+/// `RunMetadata` normalizer hook signature. Called once per `OpenRun`
+/// after the validator; returns the (possibly-modified) metadata that
+/// is finally written into the RunStart document. Mirrors bluesky's
+/// `md_normalizer`.
+pub type MdNormalizer =
+    Arc<dyn Fn(HashMap<String, Value>) -> Result<HashMap<String, Value>> + Send + Sync + 'static>;
+
+/// `scan_id_source` hook signature. Called on each `OpenRun` (when no
+/// `scan_id` is supplied via the Msg) to produce the next scan id.
+/// Mirrors bluesky's `scan_id_source(md) -> int`.
+pub type ScanIdSource = Arc<dyn Fn(&HashMap<String, Value>) -> Result<u64> + Send + Sync + 'static>;
+
+/// Plan-wrapper signature. Each registered preprocessor is applied to
+/// the plan in registration order at `run_async` entry. Mirrors
+/// bluesky's `RE.preprocessors` list.
+pub type Preprocessor = Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static>;
+
 /// `before_plan` / `after_plan` hook signature. Synchronous; called from
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -142,6 +159,12 @@ pub enum MsgResult {
         /// Stable identifier — `"cirrus.RunEngine"`.
         name: &'static str,
     },
+    /// `Msg::Subscribe` returned an id; pair with `Msg::Unsubscribe`
+    /// to remove early. Otherwise the engine drops it at run end.
+    SubscriptionId {
+        /// Stable subscription id.
+        id: SubscriptionId,
+    },
 }
 
 /// Final state of a finished run.
@@ -151,6 +174,19 @@ pub struct RunResult {
     pub run_uid: Option<String>,
     /// Final exit status (`success` / `abort` / `fail` / `halt` / `no-run`).
     pub exit_status: String,
+}
+
+/// Per-call options for [`RunEngine::run_async_with`]. Mirrors
+/// bluesky's `RE(plan, subs, **md)` extras.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Per-call metadata; merged into every `OpenRun` for this run.
+    /// Bluesky parity: `_metadata_per_call`.
+    pub md: HashMap<String, Value>,
+    /// Temporary subscribers — installed before the plan starts and
+    /// removed at run end. Bluesky parity: positional `subs` arg to
+    /// `RE.__call__`.
+    pub subs: Vec<DocumentCallback>,
 }
 
 /// Pending status group bookkeeping.
@@ -195,6 +231,12 @@ pub struct RunEngine {
     commands: StdMutex<HashMap<String, CustomCommandHandler>>,
     /// Optional metadata validator.
     md_validator: StdMutex<Option<MdValidator>>,
+    /// Optional metadata normalizer.
+    md_normalizer: StdMutex<Option<MdNormalizer>>,
+    /// Optional scan_id source override.
+    scan_id_source: StdMutex<Option<ScanIdSource>>,
+    /// Plan preprocessors applied in order at `run_async` entry.
+    preprocessors: StdMutex<Vec<Preprocessor>>,
     /// Optional pre-plan hook.
     before_plan: StdMutex<Option<PlanHook>>,
     /// Optional post-plan hook.
@@ -205,12 +247,25 @@ pub struct RunEngine {
     loop_timeout: StdMutex<Option<Duration>>,
     /// Optional handler for `Msg::Input`. `None` = inputs fail.
     input_handler: StdMutex<Option<InputHandler>>,
+    /// Per-call metadata supplied via `run_async_with`. Cleared at
+    /// run end. Mirrors bluesky's `_metadata_per_call`.
+    per_call_md: StdMutex<HashMap<String, Value>>,
+    /// Subscription ids staged by `run_async_with` *before*
+    /// `run_async` clears engine state. `run_async` migrates these
+    /// into `state.temp_subscribers` after its reset.
+    staged_temp_subs: StdMutex<Vec<SubscriptionId>>,
     /// Side-channel for the most recently-processed `Msg`'s result.
     /// Producers (Lua coroutine bridge, future async-fn plans) poll
     /// `take_msg_result` between Msg yields.
     last_msg_result: StdMutex<MsgResult>,
     /// `true` if `install_signal_handler()` has run.
     signal_installed: AtomicBool,
+    /// When `true`, the engine emits an `Event` document to a special
+    /// `"interruptions"` stream on each pause / resume / suspend.
+    /// Mirrors bluesky's `record_interruptions`. The stream is
+    /// declared on `OpenRun` (only when the flag is on at that
+    /// moment). Off by default.
+    record_interruptions: AtomicBool,
 }
 
 #[derive(Default)]
@@ -234,6 +289,11 @@ struct EngineState {
     /// `Msg::RegisterPausable` or `RunEngine::register_pausable`.
     /// Walked on every pause-enter and resume.
     pausables: HashMap<String, Arc<dyn cirrus_core::msg::PausableObj>>,
+    /// Subscription ids added during this run (via `Msg::Subscribe`
+    /// or the positional `subs` arg on `run_async_with`). Mirror of
+    /// bluesky's `_temp_callback_ids` — entries are removed
+    /// automatically when the run ends.
+    temp_subscribers: Vec<SubscriptionId>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
     rewindable: bool,
@@ -274,19 +334,57 @@ impl RunEngine {
             subscribers: Arc::new(StdMutex::new(Vec::new())),
             commands: StdMutex::new(HashMap::new()),
             md_validator: StdMutex::new(None),
+            md_normalizer: StdMutex::new(None),
+            scan_id_source: StdMutex::new(None),
+            preprocessors: StdMutex::new(Vec::new()),
             before_plan: StdMutex::new(None),
             after_plan: StdMutex::new(None),
             loop_timeout: StdMutex::new(None),
             input_handler: StdMutex::new(None),
+            per_call_md: StdMutex::new(HashMap::new()),
+            staged_temp_subs: StdMutex::new(Vec::new()),
             last_msg_result: StdMutex::new(MsgResult::None),
             signal_installed: AtomicBool::new(false),
+            record_interruptions: AtomicBool::new(false),
         }
+    }
+
+    /// Toggle interruption recording. When enabled, every subsequent
+    /// `OpenRun` declares an `"interruptions"` stream and the engine
+    /// emits an Event to it on pause / resume / suspend. Mirrors
+    /// bluesky's `RE.record_interruptions = True/False`.
+    pub fn set_record_interruptions(&self, on: bool) {
+        self.record_interruptions.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether interruption recording is enabled.
+    pub fn record_interruptions_enabled(&self) -> bool {
+        self.record_interruptions.load(Ordering::SeqCst)
     }
 
     /// Take and clear the most recent `Msg` result side channel. Returns
     /// `MsgResult::None` if nothing was written since the last take.
     pub fn take_msg_result(&self) -> MsgResult {
         std::mem::replace(&mut *self.last_msg_result.lock().unwrap(), MsgResult::None)
+    }
+
+    /// Async entry point with per-call options. Mirrors bluesky's
+    /// `RE(plan, subs, **md)`. The supplied `md` is merged into every
+    /// `OpenRun` for this run only; the `subs` are installed before
+    /// the plan starts and auto-removed at run end.
+    pub async fn run_async_with(&self, plan: Plan, opts: RunOptions) -> Result<RunResult> {
+        // Stage per-call md and temp subs before run_async resets state.
+        *self.per_call_md.lock().unwrap() = opts.md;
+        let mut staged_ids = Vec::new();
+        for cb in opts.subs {
+            staged_ids.push(self.subscribe(cb));
+        }
+        // Splice the staged ids into temp_subscribers so the run-end
+        // cleanup removes them. We need an owned guard because
+        // run_async clears state at the top — push *after* its
+        // pre-flight, via a one-shot stash.
+        *self.staged_temp_subs.lock().unwrap() = staged_ids;
+        self.run_async(plan).await
     }
 
     /// Async entry point — drive a plan to completion.
@@ -310,6 +408,23 @@ impl RunEngine {
         // Renew the cancel token so a previous abort/stop's cancel state
         // doesn't immediately tear down this run.
         *self.cancel.lock().unwrap() = CancellationToken::new();
+        // Migrate any temp subs staged by `run_async_with` into the
+        // engine state register so cleanup picks them up.
+        let staged = std::mem::take(&mut *self.staged_temp_subs.lock().unwrap());
+        if !staged.is_empty() {
+            let mut state = self.state.lock().await;
+            state.temp_subscribers.extend(staged);
+        }
+        // Apply registered preprocessors in order — each wraps the
+        // plan into a new Plan whose Msgs are filtered/extended.
+        let plan = {
+            let pps = self.preprocessors.lock().unwrap().clone();
+            let mut p = plan;
+            for pp in pps {
+                p = pp(p);
+            }
+            p
+        };
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
             Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
@@ -328,10 +443,17 @@ impl RunEngine {
         let staged = std::mem::take(&mut state.staged);
         let movables = std::mem::take(&mut state.movable_objs_touched);
         let flyables = std::mem::take(&mut state.flyable_objs_touched);
+        let temp_subs = std::mem::take(&mut state.temp_subscribers);
         let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
         let _ = std::mem::take(&mut state.monitor_tasks); // K1: monitor pumps
         drop(state);
+        // Bluesky `_temp_callback_ids` parity: subscribers added via
+        // `Msg::Subscribe` or run_async_with's `subs` arg are removed
+        // at run end so they don't leak across plans.
+        for id in temp_subs {
+            self.unsubscribe(id);
+        }
         for (_name, m) in movables {
             if let Err(e) = m.stop_on_pause(true).await {
                 tracing::warn!("stop_on_pause failed for movable {}: {e}", m.name());
@@ -346,6 +468,9 @@ impl RunEngine {
             let _ = s.unstage_dyn().await;
         }
         self.is_running.store(false, Ordering::SeqCst);
+        // Clear per-call md so a subsequent `run_async` (without
+        // `run_async_with`) sees an empty per-call register.
+        self.per_call_md.lock().unwrap().clear();
         if let Some(h) = self.after_plan.lock().unwrap().clone() {
             h();
         }
@@ -436,6 +561,31 @@ impl RunEngine {
         *self.md_validator.lock().unwrap() = v;
     }
 
+    /// Install a metadata normalizer. Runs after the validator on the
+    /// merged metadata; the returned dict is what lands in the
+    /// `RunStart` document.
+    pub fn set_md_normalizer(&self, n: Option<MdNormalizer>) {
+        *self.md_normalizer.lock().unwrap() = n;
+    }
+
+    /// Install a `scan_id_source` callback. If set, every `OpenRun`
+    /// without a caller-supplied `scan_id` consults this source
+    /// instead of the auto-increment counter.
+    pub fn set_scan_id_source(&self, s: Option<ScanIdSource>) {
+        *self.scan_id_source.lock().unwrap() = s;
+    }
+
+    /// Append a plan preprocessor. Applied in registration order at
+    /// every `run_async` entry, just before the message loop begins.
+    pub fn add_preprocessor(&self, p: Preprocessor) {
+        self.preprocessors.lock().unwrap().push(p);
+    }
+
+    /// Drop all registered preprocessors.
+    pub fn clear_preprocessors(&self) {
+        self.preprocessors.lock().unwrap().clear();
+    }
+
     /// Hook fired before each `run_async`, *before* the engine flips into
     /// `Running` state.
     pub fn set_before_plan(&self, h: Option<PlanHook>) {
@@ -486,9 +636,27 @@ impl RunEngine {
     /// auto-resume task — the next resume will fire when `fut`
     /// resolves.
     pub fn suspend_until(self: &Arc<Self>, fut: BoxFuture<'static, ()>) {
+        self.suspend_until_with(fut, None);
+    }
+
+    /// Like [`suspend_until`] but records `justification` (default
+    /// `"suspended"`) into the interruptions stream when recording
+    /// is enabled. Mirrors bluesky's `request_suspend(fut, …,
+    /// justification=…)`.
+    pub fn suspend_until_with(
+        self: &Arc<Self>,
+        fut: BoxFuture<'static, ()>,
+        justification: Option<String>,
+    ) {
         self.is_paused.store(true, Ordering::SeqCst);
         let me = Arc::downgrade(self);
+        let label = justification.unwrap_or_else(|| "suspended".into());
         tokio::spawn(async move {
+            // Record the suspend at the start so it lands before any
+            // resume event from a fast-resolving future.
+            if let Some(me) = me.upgrade() {
+                me.record_interruption(&label).await;
+            }
             fut.await;
             if let Some(me) = me.upgrade() {
                 me.resume();
@@ -781,6 +949,9 @@ impl RunEngine {
                 tracing::warn!("pause_dyn failed for {}: {e}", p.name());
             }
         }
+        // Bluesky parity: record_interruption("pause") on every pause
+        // entry. No-op when recording is off or no run is open.
+        self.record_interruption("pause").await;
     }
 
     async fn on_resume(&self) {
@@ -799,6 +970,7 @@ impl RunEngine {
                 tracing::warn!("resume_dyn failed for {}: {e}", p.name());
             }
         }
+        self.record_interruption("resume").await;
     }
 
     // -- handler ------------------------------------------------------------
@@ -1066,6 +1238,19 @@ impl RunEngine {
                     name: "cirrus.RunEngine",
                 };
             }
+            Msg::Subscribe(cb) => {
+                let id = self.subscribe(cb);
+                self.state.lock().await.temp_subscribers.push(id);
+                *self.last_msg_result.lock().unwrap() = MsgResult::SubscriptionId { id };
+            }
+            Msg::Unsubscribe(id) => {
+                self.unsubscribe(id);
+                self.state
+                    .lock()
+                    .await
+                    .temp_subscribers
+                    .retain(|i| *i != id);
+            }
             Msg::Configure { obj, args } => {
                 obj.configure_dyn(args).await?;
             }
@@ -1198,6 +1383,38 @@ impl RunEngine {
         self.suspender_count.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Emit an Event to the special `"interruptions"` stream. No-op
+    /// when recording is off, when there is no open run, or when the
+    /// `OpenRun` happened *before* recording was turned on (the
+    /// stream is declared at OpenRun time only).
+    async fn record_interruption(&self, content: &str) {
+        if !self.record_interruptions.load(Ordering::SeqCst) {
+            return;
+        }
+        let bundle = {
+            let state = self.state.lock().await;
+            let bundler = match state.bundler.as_ref() {
+                Some(b) => b,
+                None => return,
+            };
+            if bundler.descriptor_uid("interruptions").is_none() {
+                return;
+            }
+            bundler.bundle()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut data = HashMap::new();
+        data.insert("interruption".to_string(), Value::String(content.into()));
+        let mut timestamps = HashMap::new();
+        timestamps.insert("interruption".to_string(), now);
+        if let Some(ev) = bundle.event("interruptions", data, timestamps) {
+            let _ = self.broadcast(&Document::Event(ev)).await;
+        }
+    }
+
     async fn install_suspender(&self, id: u64, susp: Arc<dyn Any + Send + Sync>) -> Result<()> {
         // Recover the typed handle. The plan-side Msg carried `Arc<dyn Any>`
         // wrapping an `Arc<dyn Suspender>`.
@@ -1226,23 +1443,18 @@ impl RunEngine {
     }
 
     async fn open_run(&self, meta: RunMetadata) -> Result<String> {
-        // Resolve scan_id: caller-supplied wins; otherwise auto-increment.
-        let scan_id = match meta.scan_id {
-            Some(s) => {
-                self.scan_id.store(s, Ordering::SeqCst);
-                Some(s)
-            }
-            None => Some(self.scan_id.fetch_add(1, Ordering::SeqCst) + 1),
-        };
-        let mut start_doc = RunBundle::start(scan_id, None);
-        // Merge persistent metadata (`md`) first, then per-run extras override.
-        let merged: HashMap<String, Value> = {
+        // Merge persistent metadata first; per-run extras override.
+        let mut merged: HashMap<String, Value> = {
             let mut m = self.md.lock().unwrap().clone();
+            // Per-call metadata is also merged here (set by
+            // `run_async_with`). Per-run `meta.extra` wins over
+            // per-call which wins over persistent.
+            let per_call = self.per_call_md.lock().unwrap().clone();
+            for (k, v) in per_call {
+                m.insert(k, v);
+            }
             for (k, v) in &meta.extra {
                 m.insert(k.clone(), v.clone());
-            }
-            if let Some(scan_id) = scan_id {
-                m.entry("scan_id".into()).or_insert(Value::from(scan_id));
             }
             if let Some(ref pn) = meta.plan_name {
                 m.entry("plan_name".into())
@@ -1250,9 +1462,34 @@ impl RunEngine {
             }
             m
         };
+        // Resolve scan_id: caller-supplied via Msg wins; else
+        // scan_id_source if installed; else auto-increment counter.
+        let scan_id = match meta.scan_id {
+            Some(s) => {
+                self.scan_id.store(s, Ordering::SeqCst);
+                Some(s)
+            }
+            None => {
+                let src = self.scan_id_source.lock().unwrap().clone();
+                match src {
+                    Some(s) => Some(s(&merged)?),
+                    None => Some(self.scan_id.fetch_add(1, Ordering::SeqCst) + 1),
+                }
+            }
+        };
+        if let Some(scan_id) = scan_id {
+            merged
+                .entry("scan_id".into())
+                .or_insert(Value::from(scan_id));
+        }
+        let mut start_doc = RunBundle::start(scan_id, None);
         // Validator hook.
         if let Some(v) = self.md_validator.lock().unwrap().clone() {
             v(&merged)?;
+        }
+        // Normalizer hook — runs after validator.
+        if let Some(n) = self.md_normalizer.lock().unwrap().clone() {
+            merged = n(merged)?;
         }
         for (k, v) in merged {
             start_doc.extra.insert(k, v);
@@ -1260,13 +1497,44 @@ impl RunEngine {
         let bundle = Arc::new(RunBundle::open(&start_doc));
         let uid = start_doc.uid.clone();
         self.broadcast(&Document::Start(start_doc)).await?;
-        let mut state = self.state.lock().await;
-        if state.bundler.is_some() {
-            return Err(CirrusError::Plan(
-                "OpenRun while a previous run is still open".into(),
-            ));
+        let interruptions_descriptor = {
+            let mut state = self.state.lock().await;
+            if state.bundler.is_some() {
+                return Err(CirrusError::Plan(
+                    "OpenRun while a previous run is still open".into(),
+                ));
+            }
+            let mut bundler = RunBundler::new(bundle);
+            // Declare the interruptions stream upfront when recording
+            // is on at OpenRun. Bluesky declares it inside the Bundler
+            // open_run path; same effect here.
+            let descriptor = if self.record_interruptions.load(Ordering::SeqCst) {
+                let mut keys = HashMap::new();
+                keys.insert(
+                    "interruption".into(),
+                    cirrus_event_model::DataKey {
+                        source: "RunEngine".into(),
+                        dtype: cirrus_event_model::Dtype::String,
+                        shape: vec![],
+                        dtype_numpy: None,
+                        external: None,
+                        units: None,
+                        precision: None,
+                        object_name: None,
+                        dims: None,
+                        limits: None,
+                    },
+                );
+                Some(bundler.declare_stream("interruptions".into(), keys)?)
+            } else {
+                None
+            };
+            state.bundler = Some(bundler);
+            descriptor
+        };
+        if let Some(d) = interruptions_descriptor {
+            self.broadcast(&Document::Descriptor(d)).await?;
         }
-        state.bundler = Some(RunBundler::new(bundle));
         Ok(uid)
     }
 

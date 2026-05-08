@@ -13,6 +13,10 @@ use std::time::Duration;
 /// Group identifier used to tie multiple Statuses together for `Wait`.
 pub type GroupId = String;
 
+/// Callback type for `Msg::Subscribe` — receives every emitted
+/// `Document`. Mirrors bluesky's positional `subs` callback.
+pub type SubscribeCallback = Arc<dyn Fn(&cirrus_event_model::Document) + Send + Sync + 'static>;
+
 /// Run-level metadata attached to `OpenRun`.
 #[derive(Clone, Debug, Default)]
 pub struct RunMetadata {
@@ -214,6 +218,15 @@ pub enum Msg {
     /// the legacy bluesky RunEngine.
     ReClass,
 
+    /// Add a temporary Document subscriber. Returned id lands in
+    /// `MsgResult::SubscriptionId`. Mirrors bluesky's
+    /// `Msg('subscribe', None, callback, name)`. Subscribers added
+    /// this way are auto-removed at run end.
+    Subscribe(SubscribeCallback),
+    /// Remove a subscriber by id (the value previously returned via
+    /// `MsgResult::SubscriptionId`).
+    Unsubscribe(u64),
+
     /// Resume after a deferred pause / suspend.
     Resume,
 
@@ -285,6 +298,8 @@ impl Msg {
                 | Msg::Locate(_)
                 | Msg::Input { .. }
                 | Msg::ReClass
+                | Msg::Subscribe(_)
+                | Msg::Unsubscribe(_)
                 | Msg::Null
         )
     }
@@ -403,6 +418,8 @@ impl Clone for Msg {
                 prompt: prompt.clone(),
             },
             Msg::ReClass => Msg::ReClass,
+            Msg::Subscribe(cb) => Msg::Subscribe(cb.clone()),
+            Msg::Unsubscribe(id) => Msg::Unsubscribe(*id),
             Msg::Resume => Msg::Resume,
             Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
                 id: *id,
@@ -455,6 +472,8 @@ impl std::fmt::Debug for Msg {
             Msg::UnregisterPausable(o) => write!(f, "UnregisterPausable({})", o.name()),
             Msg::Input { prompt } => write!(f, "Input({prompt:?})"),
             Msg::ReClass => write!(f, "ReClass"),
+            Msg::Subscribe(_) => write!(f, "Subscribe(<cb>)"),
+            Msg::Unsubscribe(id) => write!(f, "Unsubscribe({id})"),
             Msg::Resume => write!(f, "Resume"),
             Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),
