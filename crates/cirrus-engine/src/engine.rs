@@ -639,7 +639,7 @@ impl RunEngine {
         self.suspend_until_with(fut, None);
     }
 
-    /// Like [`suspend_until`] but records `justification` (default
+    /// Like [`Self::suspend_until`] but records `justification` (default
     /// `"suspended"`) into the interruptions stream when recording
     /// is enabled. Mirrors bluesky's `request_suspend(fut, …,
     /// justification=…)`.
@@ -664,7 +664,7 @@ impl RunEngine {
         });
     }
 
-    /// Synonym for [`pause`]. Mirrors bluesky's `RE.request_pause`.
+    /// Synonym for [`Self::pause`]. Mirrors bluesky's `RE.request_pause`.
     pub fn request_pause(&self, defer: bool) {
         self.pause(defer);
     }

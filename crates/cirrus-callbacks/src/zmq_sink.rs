@@ -138,7 +138,13 @@ impl ZmqDocumentSink {
     fn build_envelope(&self, doc: &Document) -> Result<Vec<u8>> {
         let body = self.encode_body(doc)?;
         let name = document_name(doc).as_bytes();
-        // <prefix> <name> <body> — prefix may be empty; if so, no leading space.
+        // Wire format: `<prefix> <name> <body>` with literal space
+        // separators — matches bluesky's `Publisher.__call__`:
+        //     b" ".join([self._prefix, name.encode(), self._serializer(doc)])
+        // When prefix is empty bytes, the message starts with a
+        // leading space (` <name> <body>`). bluesky's
+        // `RemoteDispatcher` splits on the first two spaces, so the
+        // empty first element is fine.
         let mut buf = Vec::with_capacity(self.prefix.len() + 1 + name.len() + 1 + body.len());
         buf.extend_from_slice(&self.prefix);
         buf.push(b' ');

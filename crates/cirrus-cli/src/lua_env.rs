@@ -19,10 +19,10 @@
 //! are still delivered to Lua subscribers, just batched to run end —
 //! sufficient for the prototype/debug workflow.
 //!
-//! The other Lua callbacks ([`RE:set_input_handler`],
-//! [`RE:set_md_validator`], [`RE:set_md_normalizer`],
-//! [`RE:set_scan_id_source`], [`RE:set_before_plan`],
-//! [`RE:set_after_plan`], [`RE:register_command`]) are still subject
+//! The other Lua callbacks (`RE:set_input_handler`,
+//! `RE:set_md_validator`, `RE:set_md_normalizer`,
+//! `RE:set_scan_id_source`, `RE:set_before_plan`,
+//! `RE:set_after_plan`, `RE:register_command`) are still subject
 //! to the original constraint: they MUST fire on the REPL thread.
 //! That holds in practice because the engine invokes them inline
 //! during `run_async` (driven by the REPL's `block_on`), never from

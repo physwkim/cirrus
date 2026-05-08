@@ -16,8 +16,13 @@ fn rand_port() -> u16 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u32;
-    let base = 49_000u16;
-    let offset = ((nanos.wrapping_add(bump as u32 * 17)) & 0x3FF) as u16;
+    // Use 14 bits of entropy (16384 slots) instead of 10 (1024) so
+    // parallel test runs collide on the IPC socket path far less
+    // often. The "port" here is a stringification ingredient only —
+    // collisions land two tests on the same ipc:// path, so the
+    // second `bind` fails with "Address already in use".
+    let base = 32_768u16;
+    let offset = ((nanos.wrapping_add(bump as u32 * 16_777_213)) & 0x3FFF) as u16;
     base.saturating_add(offset)
 }
 
