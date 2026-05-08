@@ -212,6 +212,43 @@ pub fn spiral_square_pattern(
     out
 }
 
+/// `spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor)` —
+/// Fermat (sunflower) spiral with golden-angle increments. `dr` is the
+/// radial step; `factor` typically `1.0`. Emits points whose coordinates
+/// fall inside the bounding rect; stops when the radial distance
+/// exceeds the rect diagonal.
+pub fn spiral_fermat_pattern(
+    x_start: f64,
+    y_start: f64,
+    x_range: f64,
+    y_range: f64,
+    dr: f64,
+    factor: f64,
+) -> Vec<(f64, f64)> {
+    use std::f64::consts::PI;
+    if dr <= 0.0 || factor <= 0.0 {
+        return Vec::new();
+    }
+    let golden = PI * (3.0 - 5.0_f64.sqrt());
+    let half_x = x_range / 2.0;
+    let half_y = y_range / 2.0;
+    let max_r = (half_x * half_x + half_y * half_y).sqrt();
+    let mut out = Vec::new();
+    for n in 0..1_000_000 {
+        let r = dr * factor * (n as f64).sqrt();
+        if r > max_r {
+            break;
+        }
+        let theta = golden * n as f64;
+        let x = x_start + r * theta.cos();
+        let y = y_start + r * theta.sin();
+        if (x - x_start).abs() <= half_x && (y - y_start).abs() <= half_y {
+            out.push((x, y));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

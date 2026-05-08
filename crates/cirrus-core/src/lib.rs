@@ -10,6 +10,7 @@ pub mod reading;
 pub mod runtime;
 pub mod status;
 pub mod subscription;
+pub mod suspender;
 
 pub use error::{CirrusError, Result};
 pub use kind::Kind;
@@ -19,6 +20,7 @@ pub use reading::{ReadingF64, ReadingValue, TypedReading};
 pub use runtime::{cirrus_runtime, runtime_handle};
 pub use status::{Status, StatusError, StatusOutcome, SubToken};
 pub use subscription::Subscription;
+pub use suspender::Suspender;
 
 // re-export selected event-model types so devices/plans don't have to
 // depend on cirrus-event-model directly.

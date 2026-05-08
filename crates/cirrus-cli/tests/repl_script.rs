@@ -321,6 +321,148 @@ RE:run(plan(p))
 }
 
 #[test]
+fn bp_namespace_all_compound_plans_run() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local m2 = soft_motor("m2", 0.0)
+local d1 = soft_detector("d1")
+
+assert(string.find(RE:run(bp.count({d1}, 2)), "exit_status=success"))
+assert(string.find(RE:run(bp.scan({d1}, m1, 0, 1, 3)), "exit_status=success"))
+assert(string.find(RE:run(bp.list_scan({d1}, m1, {0, 0.5, 1})), "exit_status=success"))
+assert(string.find(RE:run(bp.rel_scan({d1}, m1, -0.1, 0.1, 3)), "exit_status=success"))
+assert(string.find(RE:run(bp.rel_list_scan({d1}, m1, {-0.05, 0.05})), "exit_status=success"))
+assert(string.find(
+  RE:run(bp.grid_scan({d1},
+    {{motor=m1, start=0, stop=0.2, num=2}, {motor=m2, start=0, stop=0.3, num=2}})),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.inner_product_scan({d1}, 3,
+    {{motor=m1, start=0, stop=1}, {motor=m2, start=0, stop=2}})),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.spiral_square({d1}, m1, m2, 0, 0, 0.4, 0.4, 3, 3)),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.spiral_fermat({d1}, m1, m2, 0, 0, 0.5, 0.5, 0.1, 1.0)),
+  "exit_status=success"))
+assert(string.find(RE:run(bp.log_scan({d1}, m1, 0.01, 1.0, 5)), "exit_status=success"))
+print("OK")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
+}
+
+#[test]
+fn bps_namespace_stub_plans() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local d1 = soft_detector("d1")
+
+-- 1-Msg / small stubs
+assert(string.find(RE:run(bps.null()), "exit_status="))
+assert(string.find(RE:run(bps.sleep(0.005)), "exit_status="))
+assert(string.find(RE:run(bps.mv(m1, 0.5)), "exit_status="))
+assert(string.find(RE:run(bps.mvr(m1, 0.1)), "exit_status="))
+assert(string.find(RE:run(bps.abs_set(m1, 1.0)), "exit_status="))
+
+-- bps.read inside a properly-bracketed run
+local body = bpp.pchain({bps.create("primary"), bps.read(m1), bps.save()})
+assert(string.find(RE:run(bpp.run_wrapper(body)), "exit_status=success"))
+
+-- repeater builds N sub-plans and chains them
+local p = bps.repeater(3, function(i) return bp.count({d1}, 1) end)
+assert(string.find(RE:run(p), "exit_status=success"))
+print("OK")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
+}
+
+#[test]
+fn bpt_namespace_pattern_generators() {
+    let (out, err, code) = run_script(
+        r#"
+local pts = bpt.inner_product(3, {{0, 10}, {5, 15}})
+assert(#pts == 3)
+assert(pts[1][1] == 0 and pts[1][2] == 5)
+assert(pts[3][1] == 10 and pts[3][2] == 15)
+
+local grid = bpt.outer_product({{0, 1, 2}, {10, 20, 2}})
+assert(#grid == 4)
+
+local sp = bpt.spiral_fermat(0, 0, 1, 1, 0.1, 1.0)
+assert(#sp > 5, "spiral_fermat should yield several points")
+
+local sq = bpt.spiral_square(0, 0, 4, 4, 5, 5)
+assert(#sq == 25)
+
+print("OK")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
+}
+
+#[test]
+fn bpp_namespace_preprocessors() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local d1 = soft_detector("d1")
+
+-- run_wrapper around a no-run plan opens/closes the run
+assert(string.find(
+  RE:run(bpp.run_wrapper(bps.null(), {plan_name="wrapped"})),
+  "exit_status=success"))
+
+-- print_summary echoes Msgs to stderr but plan still runs
+assert(string.find(
+  RE:run(bpp.print_summary(bp.count({d1}, 1))),
+  "exit_status=success"))
+
+-- pchain combines two plans
+assert(string.find(
+  RE:run(bpp.pchain({bp.count({d1}, 1), bp.count({d1}, 1)})),
+  "exit_status=success"))
+
+-- inject_md merges into RunStart extras
+assert(string.find(
+  RE:run(bpp.inject_md(bp.count({d1}, 1), {operator="alice"})),
+  "exit_status=success"))
+
+-- contingency_wrapper falls through to finally
+assert(string.find(
+  RE:run(bpp.contingency(bp.count({d1}, 1), bps.null())),
+  "exit_status=success"))
+
+-- finalize_wrapper too
+assert(string.find(
+  RE:run(bpp.finalize_wrapper(bp.count({d1}, 1), bps.null())),
+  "exit_status=success"))
+
+-- relative_set_wrapper + reset_positions_wrapper around a 0-span scan
+assert(string.find(
+  RE:run(bpp.relative_set(bps.mv(m1, 0.1), {m1})),
+  "exit_status="))
+
+-- msg_mutator: rewrite each Msg through a Lua function (identity here)
+local p = bp.count({d1}, 1)
+local mutated = bpp.msg_mutator(p, function(m) return m end)
+assert(string.find(RE:run(mutated), "exit_status=success"))
+
+print("OK")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
+}
+
+#[test]
 fn coroutine_close_run_returns_exit_status() {
     let (out, err, code) = run_script(
         r#"

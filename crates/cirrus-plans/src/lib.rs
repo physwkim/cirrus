@@ -811,6 +811,76 @@ pub fn rel_grid_scan(
     })
 }
 
+/// `log_scan(detectors, motor, motor_readback, start, stop, num)` —
+/// 1-D scan with logarithmically-spaced points (`start` and `stop`
+/// must be the same sign and non-zero). Calls `list_scan` internally.
+pub fn log_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn MovableObj>,
+    motor_readback: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+) -> Plan {
+    if num == 0 || start == 0.0 || stop == 0.0 || start.signum() != stop.signum() {
+        return stubs::null();
+    }
+    let log_start = start.abs().ln();
+    let log_stop = stop.abs().ln();
+    let sign = start.signum();
+    let points: Vec<f64> = (0..num)
+        .map(|i| {
+            let t = if num > 1 {
+                i as f64 / (num as f64 - 1.0)
+            } else {
+                0.0
+            };
+            sign * (log_start + (log_stop - log_start) * t).exp()
+        })
+        .collect();
+    list_scan(detectors, motor, motor_readback, points)
+}
+
+/// `spiral_fermat(detectors, x_motor, x_reader, y_motor, y_reader,
+/// x_start, y_start, x_range, y_range, dr, factor)` —
+/// Fermat (sunflower) spiral via golden-angle increments. See
+/// `patterns::spiral_fermat_pattern`.
+#[allow(clippy::too_many_arguments)]
+pub fn spiral_fermat(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn MovableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn MovableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_start: f64,
+    y_start: f64,
+    x_range: f64,
+    y_range: f64,
+    dr: f64,
+    factor: f64,
+) -> Plan {
+    let pts = patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor);
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("spiral_fermat".into()),
+            ..Default::default()
+        });
+        for (x, y) in pts {
+            yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
+            yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Read(x_reader.clone());
+            yield Msg::Read(y_reader.clone());
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
 /// `fly(flyer, dets)` — kickoff, collect while completing, unstage.
 pub fn fly(
     flyer: Arc<dyn FlyableObj>,

@@ -297,6 +297,9 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
     // msg.* — Msg constructors for use INSIDE coroutine plans.
     register_msg_namespace(lua)?;
 
+    // bp.* / bps.* / bpt.* / bpp.* namespaces — full bluesky surface.
+    register_bluesky_namespaces(lua)?;
+
     // plan(fn, ...) — defer Plan construction until RE:run so the
     // bridge can capture the engine reference (needed to surface return
     // values back to the coroutine).
@@ -772,6 +775,1123 @@ fn msg_result_to_lua(lua: &Lua, r: cirrus_engine::MsgResult) -> LuaValue {
             LuaValue::Table(t)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// bp / bps / bpt / bpp namespaces — full bluesky-compatible Lua surface.
+// ---------------------------------------------------------------------------
+
+fn take_inner_plan(ud: &mlua::AnyUserData) -> mlua::Result<Plan> {
+    let lp = ud.borrow::<LuaPlan>()?;
+    let kind = lp
+        .kind
+        .blocking_lock()
+        .take()
+        .ok_or_else(|| mlua::Error::RuntimeError("plan was already consumed".into()))?;
+    match kind {
+        LuaPlanKind::Prebuilt(p) => Ok(p),
+        LuaPlanKind::Coroutine { .. } => Err(mlua::Error::RuntimeError(
+            "coroutine plans (built via plan()) can't be wrapped by bpp.* — \
+             pass a prebuilt plan (count/scan/...) instead"
+                .into(),
+        )),
+    }
+}
+
+fn wrap_prebuilt(label: impl Into<String>, plan: Plan) -> LuaPlan {
+    LuaPlan {
+        label: label.into(),
+        kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
+    }
+}
+
+fn dets(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn ReadableObj>>> {
+    dets_table_to_readables(t)
+}
+
+fn devs_of(t: &mlua::Table, role: &'static str) -> mlua::Result<Vec<Arc<dyn StageableObj>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let s = d
+            .stageable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not {}", d.name, role)))?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
+fn motors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn LocatableObj>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let l = d
+            .locatable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
+        out.push(l);
+    }
+    Ok(out)
+}
+
+fn monitors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn MonitorableObj>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let m = d
+            .monitorable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
+        out.push(m);
+    }
+    Ok(out)
+}
+
+type MotorMR = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, String);
+
+fn motor_movable_readable(ud: &mlua::AnyUserData) -> mlua::Result<MotorMR> {
+    let d = ud.borrow::<LuaDevice>()?;
+    let mv = d
+        .movable
+        .clone()
+        .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
+    let rd = d
+        .readable
+        .clone()
+        .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", d.name)))?;
+    Ok((mv, rd, d.name.clone()))
+}
+
+fn vec_f64(t: &mlua::Table) -> mlua::Result<Vec<f64>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<f64>() {
+        out.push(v?);
+    }
+    Ok(out)
+}
+
+fn nested_vec_f64(t: &mlua::Table) -> mlua::Result<Vec<Vec<f64>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::Table>() {
+        out.push(vec_f64(&v?)?);
+    }
+    Ok(out)
+}
+
+fn lua_table_to_metadata(t: Option<mlua::Table>) -> mlua::Result<cirrus_core::msg::RunMetadata> {
+    let mut m = cirrus_core::msg::RunMetadata::default();
+    let Some(t) = t else { return Ok(m) };
+    if let Ok(s) = t.get::<String>("plan_name") {
+        m.plan_name = Some(s);
+    }
+    if let Ok(n) = t.get::<u64>("scan_id") {
+        m.scan_id = Some(n);
+    }
+    for pair in t.pairs::<String, LuaValue>().flatten() {
+        if pair.0 != "plan_name" && pair.0 != "scan_id" {
+            m.extra.insert(pair.0, lua_value_to_json(&pair.1)?);
+        }
+    }
+    Ok(m)
+}
+
+fn register_bluesky_namespaces(lua: &Lua) -> mlua::Result<()> {
+    register_bp(lua)?;
+    register_bps(lua)?;
+    register_bpt(lua)?;
+    register_bpp(lua)?;
+    Ok(())
+}
+
+fn register_bp(lua: &Lua) -> mlua::Result<()> {
+    let bp = lua.create_table()?;
+
+    bp.set(
+        "count",
+        lua.create_function(|_, (dt, num): (mlua::Table, usize)| {
+            Ok(wrap_prebuilt(
+                format!("count(n={num})"),
+                cirrus_plans::count(dets(&dt)?, num),
+            ))
+        })?,
+    )?;
+    bp.set(
+        "count_with_trigger",
+        lua.create_function(
+            |_, (dets_t, trigs_t, num): (mlua::Table, mlua::Table, usize)| {
+                let dets = dets_table_to_readables(&dets_t)?;
+                let mut trigs: Vec<Arc<dyn TriggerableObj>> = Vec::new();
+                for v in trigs_t.clone().sequence_values::<mlua::AnyUserData>() {
+                    let ud = v?;
+                    let d = ud.borrow::<LuaDevice>()?;
+                    let t = d
+                        .triggerable
+                        .clone()
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!("{} is not triggerable", d.name))
+                        })?;
+                    trigs.push(t);
+                }
+                Ok(wrap_prebuilt(
+                    format!("count_with_trigger(n={num})"),
+                    cirrus_plans::count_with_trigger(dets, trigs, num),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "scan",
+        lua.create_function(
+            |_, (dt, mu, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
+                let (mv, rd, _) = motor_movable_readable(&mu)?;
+                Ok(wrap_prebuilt(
+                    format!("scan(n={num})"),
+                    cirrus_plans::scan(dets(&dt)?, mv, rd, start, stop, num),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "list_scan",
+        lua.create_function(
+            |_, (dt, mu, points_t): (mlua::Table, mlua::AnyUserData, mlua::Table)| {
+                let (mv, rd, _) = motor_movable_readable(&mu)?;
+                Ok(wrap_prebuilt(
+                    "list_scan",
+                    cirrus_plans::list_scan(dets(&dt)?, mv, rd, vec_f64(&points_t)?),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "rel_scan",
+        lua.create_function(
+            |_, (dt, mu, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
+                let d = mu.borrow::<LuaDevice>()?;
+                let mv = d.movable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not movable", d.name))
+                })?;
+                let rd = d.readable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not readable", d.name))
+                })?;
+                let lo = d.locatable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not locatable", d.name))
+                })?;
+                // Fetch current readback so rel_scan can compute the
+                // absolute window. Lua callbacks run from the sync REPL
+                // thread, so block_on is safe here.
+                let current = cirrus_core::runtime::cirrus_runtime()
+                    .block_on(lo.locate_dyn())
+                    .map(|l| l.readback)
+                    .unwrap_or(0.0);
+                Ok(wrap_prebuilt(
+                    format!("rel_scan(n={num})"),
+                    cirrus_plans::rel_scan(dets(&dt)?, mv, rd, current, start, stop, num),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "rel_list_scan",
+        lua.create_function(
+            |_, (dt, mu, points_t): (mlua::Table, mlua::AnyUserData, mlua::Table)| {
+                let d = mu.borrow::<LuaDevice>()?;
+                let lo = d.locatable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not locatable", d.name))
+                })?;
+                let rd = d.readable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not readable", d.name))
+                })?;
+                Ok(wrap_prebuilt(
+                    "rel_list_scan",
+                    cirrus_plans::rel_list_scan(dets(&dt)?, lo, rd, vec_f64(&points_t)?),
+                ))
+            },
+        )?,
+    )?;
+    // grid_scan(detectors, axes_table) where axes_table is a list of
+    // tables: { {motor=, start=, stop=, num=}, ... }. The motor must be
+    // both Movable and Readable.
+    // grid_scan: 2D only in cirrus-plans. Pass {axes={a1, a2}} where each
+    // axis is {motor=, start=, stop=, num=}.
+    bp.set(
+        "grid_scan",
+        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let (a1, a2) = pair_grid_axes(&axes_t)?;
+            Ok(wrap_prebuilt(
+                "grid_scan",
+                cirrus_plans::grid_scan(
+                    dets, a1.0, a1.1, a1.2, a1.3, a1.4, a2.0, a2.1, a2.2, a2.3, a2.4,
+                ),
+            ))
+        })?,
+    )?;
+    bp.set(
+        "rel_grid_scan",
+        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let (a1, a2) = pair_grid_rel_axes(&axes_t)?;
+            Ok(wrap_prebuilt(
+                "rel_grid_scan",
+                cirrus_plans::rel_grid_scan(
+                    dets, a1.0, a1.1, a1.2, a1.3, a1.4, a2.0, a2.1, a2.2, a2.3, a2.4,
+                ),
+            ))
+        })?,
+    )?;
+    bp.set(
+        "list_grid_scan",
+        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let axes = axes_table_to_list_grid_axes(&axes_t)?;
+            Ok(wrap_prebuilt(
+                "list_grid_scan",
+                cirrus_plans::list_grid_scan(dets, axes),
+            ))
+        })?,
+    )?;
+    bp.set(
+        "inner_product_scan",
+        lua.create_function(
+            |_, (dt, num, axes_t): (mlua::Table, usize, mlua::Table)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let axes = axes_table_to_inner_product(&axes_t)?;
+                Ok(wrap_prebuilt(
+                    format!("inner_product_scan(n={num})"),
+                    cirrus_plans::inner_product_scan(dets, num, axes),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "scan_nd",
+        lua.create_function(
+            |_, (dt, axes_t, points_t): (mlua::Table, mlua::Table, mlua::Table)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let axes = axes_table_to_scan_nd(&axes_t)?;
+                let points = nested_vec_f64(&points_t)?;
+                Ok(wrap_prebuilt(
+                    format!("scan_nd(n={})", points.len()),
+                    cirrus_plans::scan_nd(dets, axes, points),
+                ))
+            },
+        )?,
+    )?;
+    // spiral / spiral_square / spiral_fermat — same arg shape.
+    bp.set(
+        "spiral",
+        lua.create_function(
+            |_,
+             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, nth): (
+                mlua::Table,
+                mlua::AnyUserData,
+                mlua::AnyUserData,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                usize,
+            )| {
+                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+                Ok(wrap_prebuilt(
+                    "spiral",
+                    cirrus_plans::spiral(
+                        dets(&dt)?,
+                        xmv,
+                        xrd,
+                        ymv,
+                        yrd,
+                        x_start,
+                        y_start,
+                        x_range,
+                        y_range,
+                        dr,
+                        nth,
+                    ),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "spiral_square",
+        lua.create_function(
+            |_,
+             (dt, xm, ym, xc, yc, xr, yr, xn, yn): (
+                mlua::Table,
+                mlua::AnyUserData,
+                mlua::AnyUserData,
+                f64,
+                f64,
+                f64,
+                f64,
+                usize,
+                usize,
+            )| {
+                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+                Ok(wrap_prebuilt(
+                    "spiral_square",
+                    cirrus_plans::spiral_square(
+                        dets(&dt)?,
+                        xmv,
+                        xrd,
+                        ymv,
+                        yrd,
+                        xc,
+                        yc,
+                        xr,
+                        yr,
+                        xn,
+                        yn,
+                    ),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "spiral_fermat",
+        lua.create_function(
+            |_,
+             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, factor): (
+                mlua::Table,
+                mlua::AnyUserData,
+                mlua::AnyUserData,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+            )| {
+                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+                Ok(wrap_prebuilt(
+                    "spiral_fermat",
+                    cirrus_plans::spiral_fermat(
+                        dets(&dt)?,
+                        xmv,
+                        xrd,
+                        ymv,
+                        yrd,
+                        x_start,
+                        y_start,
+                        x_range,
+                        y_range,
+                        dr,
+                        factor,
+                    ),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "ramp_plan",
+        lua.create_function(
+            |_, (go_plan, dt, period_secs, samples): (mlua::AnyUserData, mlua::Table, f64, usize)| {
+                let go = take_inner_plan(&go_plan)?;
+                Ok(wrap_prebuilt(
+                    format!("ramp_plan(n={samples})"),
+                    cirrus_plans::ramp_plan(
+                        go,
+                        dets(&dt)?,
+                        std::time::Duration::from_secs_f64(period_secs),
+                        samples,
+                    ),
+                ))
+            },
+        )?,
+    )?;
+    bp.set(
+        "log_scan",
+        lua.create_function(
+            |_, (dt, mu, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
+                let (mv, rd, _) = motor_movable_readable(&mu)?;
+                Ok(wrap_prebuilt(
+                    format!("log_scan(n={num})"),
+                    cirrus_plans::log_scan(dets(&dt)?, mv, rd, start, stop, num),
+                ))
+            },
+        )?,
+    )?;
+    // bp.fly requires a CollectableObj wrapper, which isn't on LuaDevice
+    // yet. Soft devices don't impl Flyable/Collectable, so even with the
+    // wrapper there'd be nothing to test against. Stub for future EPICS
+    // flyer / collector support.
+    bp.set(
+        "fly",
+        lua.create_function(|_, _: mlua::Variadic<LuaValue>| -> mlua::Result<LuaPlan> {
+            Err(mlua::Error::RuntimeError(
+                "bp.fly is not yet wired through Lua (needs CollectableObj wrapper). \
+                 Use a coroutine plan with msg.kickoff/complete/collect instead."
+                    .into(),
+            ))
+        })?,
+    )?;
+
+    lua.globals().set("bp", bp)?;
+    Ok(())
+}
+
+type GridAxisAbs = (
+    Arc<dyn MovableObj>,
+    Arc<dyn ReadableObj>,
+    f64,
+    f64,
+    usize,
+);
+
+type GridAxisRel = (
+    Arc<dyn LocatableObj>,
+    Arc<dyn ReadableObj>,
+    f64,
+    f64,
+    usize,
+);
+
+fn pair_grid_axes(t: &mlua::Table) -> mlua::Result<(GridAxisAbs, GridAxisAbs)> {
+    let row1: mlua::Table = t.get(1)?;
+    let row2: mlua::Table = t.get(2)?;
+    Ok((row_to_grid_axis_abs(&row1)?, row_to_grid_axis_abs(&row2)?))
+}
+
+fn pair_grid_rel_axes(t: &mlua::Table) -> mlua::Result<(GridAxisRel, GridAxisRel)> {
+    let row1: mlua::Table = t.get(1)?;
+    let row2: mlua::Table = t.get(2)?;
+    Ok((row_to_grid_axis_rel(&row1)?, row_to_grid_axis_rel(&row2)?))
+}
+
+fn row_to_grid_axis_abs(row: &mlua::Table) -> mlua::Result<GridAxisAbs> {
+    let mu: mlua::AnyUserData = row.get("motor")?;
+    let (mv, rd, _) = motor_movable_readable(&mu)?;
+    Ok((mv, rd, row.get("start")?, row.get("stop")?, row.get("num")?))
+}
+
+fn row_to_grid_axis_rel(row: &mlua::Table) -> mlua::Result<GridAxisRel> {
+    let mu: mlua::AnyUserData = row.get("motor")?;
+    let d = mu.borrow::<LuaDevice>()?;
+    let lo = d
+        .locatable
+        .clone()
+        .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
+    let rd = d
+        .readable
+        .clone()
+        .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", d.name)))?;
+    Ok((lo, rd, row.get("start")?, row.get("stop")?, row.get("num")?))
+}
+
+fn axes_table_to_list_grid_axes(t: &mlua::Table) -> mlua::Result<Vec<cirrus_plans::ListGridAxis>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::Table>() {
+        let row = v?;
+        let mu: mlua::AnyUserData = row.get("motor")?;
+        let (mv, rd, _) = motor_movable_readable(&mu)?;
+        let pts_t: mlua::Table = row.get("points")?;
+        out.push((mv, rd, vec_f64(&pts_t)?));
+    }
+    Ok(out)
+}
+
+type InnerProductAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
+
+fn axes_table_to_inner_product(
+    t: &mlua::Table,
+) -> mlua::Result<Vec<InnerProductAxis>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::Table>() {
+        let row = v?;
+        let mu: mlua::AnyUserData = row.get("motor")?;
+        let (mv, rd, _) = motor_movable_readable(&mu)?;
+        let start: f64 = row.get("start")?;
+        let stop: f64 = row.get("stop")?;
+        out.push((mv, rd, start, stop));
+    }
+    Ok(out)
+}
+
+type TrigReadVecs = (Vec<Arc<dyn TriggerableObj>>, Vec<Arc<dyn ReadableObj>>);
+
+fn split_trig_read(t: &mlua::Table) -> mlua::Result<TrigReadVecs> {
+    let mut trigs = Vec::new();
+    let mut reads = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let t = d
+            .triggerable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not triggerable", d.name)))?;
+        let r = d
+            .readable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", d.name)))?;
+        trigs.push(t);
+        reads.push(r);
+    }
+    Ok((trigs, reads))
+}
+
+type MotorPair = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>);
+
+fn axes_table_to_scan_nd(t: &mlua::Table) -> mlua::Result<Vec<MotorPair>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let (mv, rd, _) = motor_movable_readable(&ud)?;
+        out.push((mv, rd));
+    }
+    Ok(out)
+}
+
+fn register_bps(lua: &Lua) -> mlua::Result<()> {
+    let bps = lua.create_table()?;
+    use cirrus_plans::stubs;
+
+    bps.set(
+        "open_run",
+        lua.create_function(|_, md: Option<mlua::Table>| {
+            let m = lua_table_to_metadata(md)?;
+            Ok(wrap_prebuilt("open_run", stubs::open_run(m)))
+        })?,
+    )?;
+    bps.set(
+        "close_run",
+        lua.create_function(|_, (es, rs): (Option<String>, Option<String>)| {
+            Ok(wrap_prebuilt(
+                "close_run",
+                stubs::close_run(es.unwrap_or_else(|| "success".into()), rs),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "create",
+        lua.create_function(|_, name: Option<String>| {
+            Ok(wrap_prebuilt(
+                "create",
+                stubs::create(name.unwrap_or_else(|| "primary".into())),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "save",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("save", stubs::save())))?,
+    )?;
+    bps.set(
+        "drop",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("drop", stubs::drop_bundle())))?,
+    )?;
+    bps.set(
+        "read",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let r = d
+                .readable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", d.name)))?;
+            Ok(wrap_prebuilt("read", stubs::read(r)))
+        })?,
+    )?;
+    bps.set(
+        "null",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("null", stubs::null())))?,
+    )?;
+    bps.set(
+        "abs_set",
+        lua.create_function(
+            |_, (mu, v, group): (mlua::AnyUserData, f64, Option<String>)| {
+                let d = mu.borrow::<LuaDevice>()?;
+                let mv = d.movable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not movable", d.name))
+                })?;
+                Ok(wrap_prebuilt("abs_set", stubs::abs_set(mv, v, group)))
+            },
+        )?,
+    )?;
+    bps.set(
+        "mv",
+        lua.create_function(|_, (mu, v): (mlua::AnyUserData, f64)| {
+            let d = mu.borrow::<LuaDevice>()?;
+            let mv = d
+                .movable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
+            Ok(wrap_prebuilt("mv", stubs::mv(mv, v)))
+        })?,
+    )?;
+    bps.set(
+        "mvr",
+        lua.create_function(|_, (mu, delta): (mlua::AnyUserData, f64)| {
+            let d = mu.borrow::<LuaDevice>()?;
+            let lo = d.locatable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not locatable", d.name))
+            })?;
+            Ok(wrap_prebuilt("mvr", stubs::mvr(lo, delta)))
+        })?,
+    )?;
+    bps.set(
+        "trigger",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let t = d.triggerable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not triggerable", d.name))
+            })?;
+            Ok(wrap_prebuilt("trigger", stubs::trigger(t, group)))
+        })?,
+    )?;
+    bps.set(
+        "stop_dev",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stoppable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stoppable", d.name)))?;
+            Ok(wrap_prebuilt("stop", stubs::stop(s)))
+        })?,
+    )?;
+    bps.set(
+        "sleep",
+        lua.create_function(|_, secs: f64| {
+            Ok(wrap_prebuilt(
+                "sleep",
+                stubs::sleep(std::time::Duration::from_secs_f64(secs)),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "wait",
+        lua.create_function(|_, (group, timeout): (String, Option<f64>)| {
+            Ok(wrap_prebuilt(
+                "wait",
+                stubs::wait(group, timeout.map(std::time::Duration::from_secs_f64)),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "checkpoint",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("checkpoint", stubs::checkpoint())))?,
+    )?;
+    bps.set(
+        "clear_checkpoint",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("clear_checkpoint", stubs::clear_checkpoint())))?,
+    )?;
+    bps.set(
+        "pause",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("pause", stubs::pause())))?,
+    )?;
+    bps.set(
+        "deferred_pause",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("deferred_pause", stubs::deferred_pause())))?,
+    )?;
+    bps.set(
+        "resume",
+        lua.create_function(|_, ()| Ok(wrap_prebuilt("resume", stubs::resume())))?,
+    )?;
+    bps.set(
+        "kickoff",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let f = d
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", d.name)))?;
+            Ok(wrap_prebuilt("kickoff", stubs::kickoff(f, group)))
+        })?,
+    )?;
+    bps.set(
+        "complete",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let f = d
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", d.name)))?;
+            Ok(wrap_prebuilt("complete", stubs::complete(f, group)))
+        })?,
+    )?;
+    bps.set(
+        "stage",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stageable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stageable", d.name)))?;
+            Ok(wrap_prebuilt("stage", stubs::stage(s)))
+        })?,
+    )?;
+    bps.set(
+        "unstage",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stageable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stageable", d.name)))?;
+            Ok(wrap_prebuilt("unstage", stubs::unstage(s)))
+        })?,
+    )?;
+    bps.set(
+        "stage_all",
+        lua.create_function(|_, t: mlua::Table| {
+            Ok(wrap_prebuilt(
+                "stage_all",
+                stubs::stage_all(devs_of(&t, "stageable")?),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "unstage_all",
+        lua.create_function(|_, t: mlua::Table| {
+            Ok(wrap_prebuilt(
+                "unstage_all",
+                stubs::unstage_all(devs_of(&t, "stageable")?),
+            ))
+        })?,
+    )?;
+    bps.set(
+        "monitor",
+        lua.create_function(|_, (dev, name): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let m = d.monitorable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not monitorable", d.name))
+            })?;
+            Ok(wrap_prebuilt("monitor", stubs::monitor(m, name)))
+        })?,
+    )?;
+    bps.set(
+        "unmonitor",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let m = d.monitorable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not monitorable", d.name))
+            })?;
+            Ok(wrap_prebuilt("unmonitor", stubs::unmonitor(m)))
+        })?,
+    )?;
+    // bps.trigger_and_read / one_shot: each device must be both
+    // Triggerable AND Readable. Soft devices currently aren't
+    // Triggerable; this path is for EPICS-backed detectors.
+    bps.set(
+        "trigger_and_read",
+        lua.create_function(|_, (dt, name): (mlua::Table, Option<String>)| {
+            let (trigs, reads) = split_trig_read(&dt)?;
+            let plan = stubs::trigger_and_read(trigs, reads, name.unwrap_or_else(|| "primary".into()));
+            Ok(wrap_prebuilt("trigger_and_read", plan))
+        })?,
+    )?;
+    bps.set(
+        "one_shot",
+        lua.create_function(|_, dt: mlua::Table| {
+            let (trigs, reads) = split_trig_read(&dt)?;
+            Ok(wrap_prebuilt("one_shot", stubs::one_shot(trigs, reads)))
+        })?,
+    )?;
+    bps.set(
+        "repeater",
+        lua.create_function(|_, (n, f): (usize, mlua::Function)| {
+            let mut plans = Vec::with_capacity(n);
+            for i in 0..n {
+                let lp_ud: mlua::AnyUserData = f.call(i)?;
+                let p = take_inner_plan(&lp_ud)?;
+                plans.push(p);
+            }
+            Ok(wrap_prebuilt(
+                format!("repeater(n={n})"),
+                cirrus_plans::preprocessors::pchain(plans),
+            ))
+        })?,
+    )?;
+
+    lua.globals().set("bps", bps)?;
+    Ok(())
+}
+
+fn register_bpt(lua: &Lua) -> mlua::Result<()> {
+    let bpt = lua.create_table()?;
+    use cirrus_plans::patterns;
+
+    bpt.set(
+        "inner_product",
+        lua.create_function(|lua, (num, axes_t): (usize, mlua::Table)| {
+            let mut axes = Vec::new();
+            for v in axes_t.clone().sequence_values::<mlua::Table>() {
+                let row = v?;
+                let s: f64 = row.get(1)?;
+                let e: f64 = row.get(2)?;
+                axes.push((s, e));
+            }
+            let pts = patterns::inner_product(num, &axes);
+            nested_f64_to_lua_table(lua, &pts)
+        })?,
+    )?;
+    bpt.set(
+        "outer_product",
+        lua.create_function(|lua, axes_t: mlua::Table| {
+            let mut axes = Vec::new();
+            for v in axes_t.clone().sequence_values::<mlua::Table>() {
+                let row = v?;
+                let s: f64 = row.get(1)?;
+                let e: f64 = row.get(2)?;
+                let n: usize = row.get(3)?;
+                axes.push((s, e, n));
+            }
+            nested_f64_to_lua_table(lua, &patterns::outer_product(&axes))
+        })?,
+    )?;
+    bpt.set(
+        "inner_list_product",
+        lua.create_function(|lua, axes_t: mlua::Table| {
+            let axes = nested_vec_f64(&axes_t)?;
+            nested_f64_to_lua_table(lua, &patterns::inner_list_product(&axes))
+        })?,
+    )?;
+    bpt.set(
+        "outer_list_product",
+        lua.create_function(|lua, axes_t: mlua::Table| {
+            let axes = nested_vec_f64(&axes_t)?;
+            nested_f64_to_lua_table(lua, &patterns::outer_list_product(&axes))
+        })?,
+    )?;
+    bpt.set(
+        "spiral",
+        lua.create_function(
+            |lua, (xs, ys, xr, yr, dr, nth): (f64, f64, f64, f64, f64, usize)| {
+                let pts = patterns::spiral(xs, ys, xr, yr, dr, nth);
+                pairs_to_lua_table(lua, &pts)
+            },
+        )?,
+    )?;
+    bpt.set(
+        "spiral_square",
+        lua.create_function(
+            |lua, (xc, yc, xr, yr, xn, yn): (f64, f64, f64, f64, usize, usize)| {
+                let pts = patterns::spiral_square_pattern(xc, yc, xr, yr, xn, yn);
+                pairs_to_lua_table(lua, &pts)
+            },
+        )?,
+    )?;
+    bpt.set(
+        "spiral_fermat",
+        lua.create_function(
+            |lua, (xs, ys, xr, yr, dr, factor): (f64, f64, f64, f64, f64, f64)| {
+                let pts = patterns::spiral_fermat_pattern(xs, ys, xr, yr, dr, factor);
+                pairs_to_lua_table(lua, &pts)
+            },
+        )?,
+    )?;
+
+    lua.globals().set("bpt", bpt)?;
+    Ok(())
+}
+
+fn nested_f64_to_lua_table(lua: &Lua, v: &[Vec<f64>]) -> mlua::Result<mlua::Table> {
+    let outer = lua.create_table()?;
+    for (i, row) in v.iter().enumerate() {
+        let inner = lua.create_table()?;
+        for (j, x) in row.iter().enumerate() {
+            inner.set(j + 1, *x)?;
+        }
+        outer.set(i + 1, inner)?;
+    }
+    Ok(outer)
+}
+
+fn pairs_to_lua_table(lua: &Lua, v: &[(f64, f64)]) -> mlua::Result<mlua::Table> {
+    let outer = lua.create_table()?;
+    for (i, (x, y)) in v.iter().enumerate() {
+        let inner = lua.create_table()?;
+        inner.set(1, *x)?;
+        inner.set(2, *y)?;
+        outer.set(i + 1, inner)?;
+    }
+    Ok(outer)
+}
+
+fn register_bpp(lua: &Lua) -> mlua::Result<()> {
+    let bpp = lua.create_table()?;
+    use cirrus_plans::preprocessors as pp;
+
+    bpp.set(
+        "run_wrapper",
+        lua.create_function(|_, (plan_ud, md): (mlua::AnyUserData, Option<mlua::Table>)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            let m = lua_table_to_metadata(md)?;
+            Ok(wrap_prebuilt("run_wrapper", pp::run_wrapper(inner, m)))
+        })?,
+    )?;
+    bpp.set(
+        "inject_md",
+        lua.create_function(|_, (plan_ud, md_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            let mut extra = std::collections::HashMap::new();
+            for pair in md_t.pairs::<String, LuaValue>().flatten() {
+                extra.insert(pair.0, lua_value_to_json(&pair.1)?);
+            }
+            Ok(wrap_prebuilt(
+                "inject_md",
+                pp::inject_md_wrapper(inner, extra),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "rewindable",
+        lua.create_function(|_, (plan_ud, on): (mlua::AnyUserData, bool)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "rewindable_wrapper",
+                pp::rewindable_wrapper(inner, on),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "monitor_during",
+        lua.create_function(|_, (plan_ud, signals_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "monitor_during_wrapper",
+                pp::monitor_during_wrapper(inner, monitors_of(&signals_t)?),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "stage_wrapper",
+        lua.create_function(|_, (plan_ud, devs_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "stage_wrapper",
+                pp::stage_wrapper(inner, devs_of(&devs_t, "stageable")?),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "baseline_wrapper",
+        lua.create_function(
+            |_, (plan_ud, devs_t, name): (mlua::AnyUserData, mlua::Table, Option<String>)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                let dets = dets_table_to_readables(&devs_t)?;
+                Ok(wrap_prebuilt(
+                    "baseline_wrapper",
+                    pp::baseline_wrapper(inner, dets, name.unwrap_or_else(|| "baseline".into())),
+                ))
+            },
+        )?,
+    )?;
+    bpp.set(
+        "finalize_wrapper",
+        lua.create_function(
+            |_, (plan_ud, fin_ud): (mlua::AnyUserData, mlua::AnyUserData)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                let fin = take_inner_plan(&fin_ud)?;
+                Ok(wrap_prebuilt(
+                    "finalize_wrapper",
+                    pp::finalize_wrapper(inner, fin),
+                ))
+            },
+        )?,
+    )?;
+    bpp.set(
+        "subs_wrapper",
+        lua.create_function(|_, plan_ud: mlua::AnyUserData| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "subs_wrapper",
+                pp::subs_wrapper(inner, ()),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "relative_set",
+        lua.create_function(|_, (plan_ud, motors_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "relative_set_wrapper",
+                pp::relative_set_wrapper(inner, motors_of(&motors_t)?),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "reset_positions",
+        lua.create_function(|_, (plan_ud, motors_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "reset_positions_wrapper",
+                pp::reset_positions_wrapper(inner, motors_of(&motors_t)?),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "print_summary",
+        lua.create_function(|_, plan_ud: mlua::AnyUserData| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "print_summary_wrapper",
+                pp::print_summary_wrapper(inner),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "contingency",
+        lua.create_function(
+            |_, (plan_ud, fin_ud): (mlua::AnyUserData, mlua::AnyUserData)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                let fin = take_inner_plan(&fin_ud)?;
+                Ok(wrap_prebuilt(
+                    "contingency_wrapper",
+                    pp::contingency_wrapper(inner, fin),
+                ))
+            },
+        )?,
+    )?;
+    bpp.set(
+        "pchain",
+        lua.create_function(|_, plans_t: mlua::Table| {
+            let mut plans = Vec::new();
+            for v in plans_t.clone().sequence_values::<mlua::AnyUserData>() {
+                plans.push(take_inner_plan(&v?)?);
+            }
+            Ok(wrap_prebuilt("pchain", pp::pchain(plans)))
+        })?,
+    )?;
+    // msg_mutator and plan_mutator: take a Lua function. Bridges Msg
+    // userdata across the call boundary.
+    bpp.set(
+        "msg_mutator",
+        lua.create_function(
+            |lua, (plan_ud, f): (mlua::AnyUserData, mlua::Function)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                let lua_clone = lua.clone();
+                let mutated = pp::msg_mutator(inner, move |m: Msg| {
+                    let ud = match lua_clone.create_userdata(LuaMsg(m.clone())) {
+                        Ok(u) => u,
+                        Err(_) => return m,
+                    };
+                    let result: mlua::Result<mlua::AnyUserData> = f.call(ud);
+                    match result {
+                        Ok(out) => match out.borrow::<LuaMsg>() {
+                            Ok(om) => om.0.clone(),
+                            Err(_) => m,
+                        },
+                        Err(e) => {
+                            eprintln!("bpp.msg_mutator error: {e}");
+                            m
+                        }
+                    }
+                });
+                Ok(wrap_prebuilt("msg_mutator", mutated))
+            },
+        )?,
+    )?;
+
+    lua.globals().set("bpp", bpp)?;
+    Ok(())
 }
 
 fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> LuaValue {

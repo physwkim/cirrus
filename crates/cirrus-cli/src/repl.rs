@@ -210,6 +210,32 @@ Lua globals registered:
   null()                        no-op plan
   plan(fn, ...)                 wrap a Lua coroutine into a Plan
 
+bluesky-style namespaces (full surface):
+  bp.*    compound plans  (count, scan, list_scan, rel_scan,
+                            rel_list_scan, grid_scan, rel_grid_scan,
+                            inner_product_scan, scan_nd, spiral,
+                            spiral_square, spiral_fermat, ramp_plan,
+                            log_scan, count_with_trigger)
+  bps.*   1-Msg / small stubs (open_run, close_run, create, save, drop,
+                                read, null, abs_set, mv, mvr, trigger,
+                                stop_dev, sleep, wait, checkpoint,
+                                clear_checkpoint, pause, deferred_pause,
+                                resume, kickoff, complete, stage,
+                                unstage, stage_all, unstage_all,
+                                monitor, unmonitor, trigger_and_read,
+                                one_shot, repeater)
+  bpt.*   coordinate generators returning Lua tables
+                                (inner_product, outer_product,
+                                 inner_list_product, outer_list_product,
+                                 spiral, spiral_square, spiral_fermat)
+  bpp.*   preprocessors taking and returning a Plan
+                                (run_wrapper, inject_md, rewindable,
+                                 monitor_during, stage_wrapper,
+                                 baseline_wrapper, finalize_wrapper,
+                                 subs_wrapper, relative_set,
+                                 reset_positions, print_summary,
+                                 contingency, pchain, msg_mutator)
+
 Coroutine plans (generator-style) — yield Msg values via the `msg.*`
 namespace:
 

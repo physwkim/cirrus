@@ -1,24 +1,14 @@
-//! `Suspender` trait + registry. A suspender owns a future that resolves when
-//! the engine should resume. Installation hands the engine a watcher; removal
+//! Engine-side `Suspender` registry. The trait itself lives in
+//! `cirrus-core` so plan factories can reference it without depending
+//! on `cirrus-engine`. Installation hands the engine a watcher; removal
 //! aborts it (rule **K1**).
 //!
 //! Reference: bluesky `run_engine.py:1132-1310` (`install_suspender`,
 //! `request_suspend`, `_start_suspender`).
 
-use async_trait::async_trait;
-use futures::future::BoxFuture;
+pub use cirrus_core::suspender::Suspender;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-
-/// A future-producing object the engine watches. When the future resolves, the
-/// engine is signalled to resume.
-#[async_trait]
-pub trait Suspender: Send + Sync + 'static {
-    /// A short label for logs / errors.
-    fn name(&self) -> &str;
-    /// Wait for the suspending condition to clear.
-    fn watch(&self) -> BoxFuture<'static, ()>;
-}
 
 /// Boxed pre/post plan injection. `None` = nothing to inject.
 pub type SuspendInjection = Option<crate::engine::SuspendCallback>;

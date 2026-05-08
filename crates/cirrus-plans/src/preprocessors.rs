@@ -3,7 +3,10 @@
 //! These take a `Plan` (a stream of `Msg`) and return a new `Plan` whose
 //! emitted messages are mutated, prepended, appended, or interleaved.
 
-use cirrus_core::msg::{LocatableObj, MonitorableObj, Msg, ReadableObj, RunMetadata, StageableObj};
+use cirrus_core::msg::{
+    CollectableObj, FlyableObj, LocatableObj, MonitorableObj, Msg, ReadableObj, RunMetadata,
+    StageableObj,
+};
 use cirrus_core::plan::{plan_box, Plan, PlanItem};
 use futures::StreamExt;
 use serde_json::Value;
@@ -263,6 +266,91 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
             }
         }
     })
+}
+
+/// `print_summary_wrapper(plan)` — debug-print every Msg as it flows
+/// through. The Msg is printed via its `Debug` impl to stderr just
+/// before being yielded to the engine. Mirrors bluesky's
+/// `print_summary_wrapper` in spirit (cirrus emits each line eagerly
+/// rather than first collecting the full plan).
+pub fn print_summary_wrapper(inner: Plan) -> Plan {
+    plan_box(async_stream::stream! {
+        let mut inner = inner;
+        let mut idx = 0usize;
+        while let Some(item) = inner.next().await {
+            if let PlanItem::Bare(m) = item {
+                eprintln!("[plan {idx:04}] {m:?}");
+                idx += 1;
+                yield m;
+            }
+        }
+    })
+}
+
+/// `suspend_wrapper(plan, suspender)` — install `suspender` for the
+/// duration of `plan`, remove on exit. Mirrors bluesky's
+/// `suspend_wrapper`.
+pub fn suspend_wrapper(
+    inner: Plan,
+    suspender: Arc<dyn cirrus_core::Suspender>,
+) -> Plan {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let id = SEQ.fetch_add(1, Ordering::Relaxed);
+    plan_box(async_stream::stream! {
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(suspender.clone());
+        yield Msg::InstallSuspender { id, suspender: any };
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            if let PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+        yield Msg::RemoveSuspender { id };
+    })
+}
+
+/// `fly_during_wrapper(plan, flyers)` — for the duration of `plan`,
+/// `Kickoff` each `(flyer, collectable)` pair at the start and
+/// `Complete + Collect` at the end. Mirrors bluesky's
+/// `fly_during_wrapper`. Pairs the Flyable + Collectable explicitly
+/// since cirrus's protocol traits split those roles.
+pub fn fly_during_wrapper(
+    inner: Plan,
+    flyers: Vec<(Arc<dyn FlyableObj>, Arc<dyn CollectableObj>)>,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        for (f, _) in &flyers {
+            yield Msg::Kickoff { obj: f.clone(), group: Some("fly_kick".into()) };
+        }
+        yield Msg::Wait { group: "fly_kick".into(), error_on_timeout: true, timeout: None };
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            if let PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+        for (f, _) in &flyers {
+            yield Msg::Complete { obj: f.clone(), group: Some("fly_done".into()) };
+        }
+        yield Msg::Wait { group: "fly_done".into(), error_on_timeout: true, timeout: None };
+        for (_, c) in flyers {
+            yield Msg::Collect { obj: c, stream_name: None };
+        }
+    })
+}
+
+/// `contingency_wrapper(plan, finally)` — run `plan`; whether it
+/// finishes normally or aborts, then run `finally`. Bluesky's full
+/// contingency_wrapper supports try/except/else branches with
+/// exception-class filtering; cirrus's stream model doesn't surface
+/// plan-level exceptions, so this is the conservative finalize-style
+/// shape (always run `finally`). For now, identical behaviour to
+/// `finalize_wrapper`; kept as a separate name so callers expressing
+/// intent ("run cleanup if anything goes wrong") see a matching
+/// API name.
+pub fn contingency_wrapper(inner: Plan, finally: Plan) -> Plan {
+    finalize_wrapper(inner, finally)
 }
 
 /// `reset_positions_wrapper(plan, motors)` — snapshot motor positions at
