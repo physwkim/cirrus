@@ -160,6 +160,11 @@ impl RunEngine {
 
     /// Install a SIGINT handler implementing bluesky's 3-tap pattern:
     /// 1st = `pause(false)`, 2nd = `abort`, 3rd = `halt`.
+    ///
+    /// The watcher captures `Weak<Self>` and exits when the engine drops.
+    /// Holding a strong `Arc<Self>` would create a reference cycle that
+    /// pins the engine forever — bad in environments (e.g. cirrus-qs)
+    /// that recreate the engine across `environment_open/close`.
     pub fn install_signal_handler(self: &Arc<Self>) {
         if self
             .signal_installed
@@ -168,12 +173,13 @@ impl RunEngine {
         {
             return;
         }
-        let me = self.clone();
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 if tokio::signal::ctrl_c().await.is_err() {
                     return;
                 }
+                let Some(me) = weak.upgrade() else { return };
                 let n = me.sigint_count.fetch_add(1, Ordering::SeqCst) + 1;
                 match n {
                     1 => {
@@ -675,5 +681,27 @@ impl RunEngine {
 impl Default for RunEngine {
     fn default() -> Self {
         Self::new(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K1 regression: `install_signal_handler` must capture `Weak<Self>`,
+    /// not `Arc<Self>`. Otherwise the watcher pins the engine forever and
+    /// every `RunEngine::new(...)` leaks across `environment_open/close`.
+    #[tokio::test]
+    async fn install_signal_handler_does_not_pin_arc() {
+        let re = Arc::new(RunEngine::new(Vec::new()));
+        let before = Arc::strong_count(&re);
+        re.install_signal_handler();
+        // Let the spawn schedule and observe the Weak.
+        tokio::task::yield_now().await;
+        let after = Arc::strong_count(&re);
+        assert_eq!(
+            before, after,
+            "signal handler must not increment Arc<RunEngine> strong count"
+        );
     }
 }

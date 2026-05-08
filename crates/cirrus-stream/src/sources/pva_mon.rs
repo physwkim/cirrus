@@ -53,6 +53,15 @@ impl PvaMonitorSource {
     }
 }
 
+impl Drop for PvaMonitorSource {
+    fn drop(&mut self) {
+        // K1: dropping the source must terminate the spawned monitor task.
+        // The token is shared with the task via clone(); cancel() signals
+        // both clones.
+        self.cancel.cancel();
+    }
+}
+
 #[async_trait]
 impl FrameSource for PvaMonitorSource {
     fn frames(&self) -> BoxStream<'static, Frame> {
