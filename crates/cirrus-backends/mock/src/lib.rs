@@ -16,6 +16,12 @@ pub struct MockBackend<T: Clone + Send + Sync + 'static> {
     value: T,
 }
 
+impl<T: Clone + Default + Send + Sync + 'static> cirrus_devices::BackendFromPv for MockBackend<T> {
+    fn from_pv(_pv: &str) -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> MockBackend<T> {
     /// Build with a fixed value.
     pub fn new(value: T) -> Self {

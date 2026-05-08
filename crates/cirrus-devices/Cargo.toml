@@ -16,3 +16,7 @@ cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
 cirrus-derive.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+cirrus-backend-soft.workspace = true

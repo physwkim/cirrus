@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cirrus-core",
+ "cirrus-devices",
  "cirrus-event-model",
  "cirrus-protocols-async",
  "serde",
@@ -365,6 +366,7 @@ name = "cirrus-devices"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cirrus-backend-soft",
  "cirrus-core",
  "cirrus-derive",
  "cirrus-event-model",

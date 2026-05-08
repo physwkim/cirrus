@@ -17,4 +17,4 @@ uuid.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
-cirrus-devices = { path = "../../cirrus-devices" }
+cirrus-devices.workspace = true

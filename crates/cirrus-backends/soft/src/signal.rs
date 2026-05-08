@@ -42,6 +42,15 @@ impl<T: Clone + Send + Sync + 'static> Clone for SoftSignalBackend<T> {
     }
 }
 
+impl<T> cirrus_devices::BackendFromPv for SoftSignalBackend<T>
+where
+    T: Clone + Default + Send + Sync + Serialize + 'static,
+{
+    fn from_pv(_pv: &str) -> Self {
+        Self::new(T::default(), Dtype::Number)
+    }
+}
+
 impl<T> SoftSignalBackend<T>
 where
     T: Clone + Send + Sync + Serialize + 'static,
