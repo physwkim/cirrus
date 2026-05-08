@@ -184,6 +184,66 @@ print(RE:run(plan(p, "argpassed", 3)))
 }
 
 #[test]
+fn coroutine_yield_returns_run_uid_after_open_run() {
+    // The bridge surfaces the engine's just-issued run UID as the return
+    // value of `coroutine.yield(msg.open_run())`.
+    let (out, err, code) = run_script(
+        r#"
+local captured = nil
+local function p()
+    captured = coroutine.yield(msg.open_run({plan_name = "uid_test"}))
+    coroutine.yield(msg.close_run("success"))
+end
+local result = RE:run(plan(p))
+print("captured:", tostring(captured))
+print("result:", result)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // captured uid is a uuid; just verify it's a non-empty string and
+    // matches the run_uid in the result line.
+    let mut captured_line = None;
+    let mut result_line = None;
+    for line in out.lines() {
+        if let Some(s) = line.strip_prefix("captured: ") {
+            captured_line = Some(s.to_string());
+        }
+        if let Some(s) = line.strip_prefix("result: ") {
+            result_line = Some(s.to_string());
+        }
+    }
+    let captured = captured_line.expect("missing captured: line");
+    let result = result_line.expect("missing result: line");
+    assert!(
+        !captured.is_empty() && captured != "nil",
+        "captured uid should be non-nil; got {captured:?}"
+    );
+    assert!(
+        result.contains(&captured),
+        "result {result:?} should reference captured uid {captured:?}"
+    );
+}
+
+#[test]
+fn coroutine_yield_returns_nil_for_other_msgs() {
+    // Currently only OpenRun is bridged. Other Msg yields return nil.
+    // This test pins that behavior so we know if it changes.
+    let (out, err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.open_run())                -- uid (bridged)
+    local r = coroutine.yield(msg.create("primary"))
+    print("create result:", tostring(r))
+    coroutine.yield(msg.close_run("success"))
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("create result: nil"), "out = {out}");
+}
+
+#[test]
 fn coroutine_msg_constructor_type_errors_clearly() {
     // soft_detector is not movable; msg.set on it must raise a clear
     // error inside the coroutine that the bridge surfaces to stderr.

@@ -245,6 +245,19 @@ impl RunEngine {
 
     // -- query / setters ----------------------------------------------------
 
+    /// UID of the currently-open run, if any. Useful for plans that
+    /// want to capture the run UID after issuing `Msg::OpenRun` (the
+    /// Lua coroutine bridge surfaces this as the `coroutine.yield`
+    /// return value for `msg.open_run`).
+    pub async fn current_run_uid(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .bundler
+            .as_ref()
+            .map(|b| b.start_uid.clone())
+    }
+
     /// Current engine run-state. Bluesky's `RE.state`.
     pub fn state(&self) -> EngineRunState {
         if self.is_halting.load(Ordering::SeqCst) {

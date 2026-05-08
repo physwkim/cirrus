@@ -49,11 +49,30 @@ impl UserData for LuaDevice {
     }
 }
 
-/// Holder for a built `Plan`. Plans are single-use streams, so the
-/// userdata stores `Option<Plan>` and is taken on `RE:run`.
+/// Holder for a `Plan`. Two flavors:
+///
+/// - `Prebuilt`: a finished `Plan` stream, used by the canned plan
+///   factories (`count`, `scan`, …). Single-use; consumed on `RE:run`.
+/// - `Coroutine`: a `mlua::Thread` plus its initial-resume args.
+///   Bound to a specific `Arc<RunEngine>` only at `RE:run` time so the
+///   bridge can call back into engine state (for `coroutine.yield`'s
+///   return value).
 pub struct LuaPlan {
     pub label: String,
-    pub plan: TMutex<Option<Plan>>,
+    pub kind: TMutex<Option<LuaPlanKind>>,
+}
+
+/// Internal: which flavor of plan this `LuaPlan` carries.
+pub enum LuaPlanKind {
+    /// Prebuilt finished stream (count/scan/mvr/sleep/null).
+    Prebuilt(Plan),
+    /// Lua coroutine + initial args. Built into a Plan at `RE:run` so
+    /// the bridge can use the engine reference.
+    Coroutine {
+        lua: Lua,
+        thread: mlua::Thread,
+        args: Vec<LuaValue>,
+    },
 }
 
 impl UserData for LuaPlan {
@@ -84,13 +103,18 @@ impl UserData for LuaRunEngine {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("run", |_, this, plan: mlua::AnyUserData| {
             let plan_ud = plan.borrow_mut::<LuaPlan>().map_err(mlua::Error::external)?;
-            let plan = plan_ud.plan.blocking_lock().take().ok_or_else(|| {
-                mlua::Error::RuntimeError("plan was already consumed (Plans are single-use)".into())
+            let kind = plan_ud.kind.blocking_lock().take().ok_or_else(|| {
+                mlua::Error::RuntimeError(
+                    "plan was already consumed (Plans are single-use)".into(),
+                )
             })?;
             let re = this.re.clone();
-            // Lua callbacks run on the same tokio worker that drives the
-            // REPL. Use block_in_place so block_on can wait without
-            // deadlocking that worker.
+            let plan = match kind {
+                LuaPlanKind::Prebuilt(p) => p,
+                LuaPlanKind::Coroutine { lua, thread, args } => {
+                    coroutine_to_plan(lua, thread, args, re.clone())
+                }
+            };
             // Drive the plan to completion on cirrus's own runtime. Lua
             // callbacks run from a sync REPL thread (see main.rs), so
             // `block_on` here is safe.
@@ -190,7 +214,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
         let plan = cirrus_plans::count(detectors, num);
         Ok(LuaPlan {
             label: format!("count(n={})", num),
-            plan: TMutex::new(Some(plan)),
+            kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
         })
     })?;
     lua.globals().set("count", f)?;
@@ -218,7 +242,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
             let plan = cirrus_plans::scan(detectors, movable, readable, start, stop, num);
             Ok(LuaPlan {
                 label: format!("scan(n={})", num),
-                plan: TMutex::new(Some(plan)),
+                kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
             })
         },
     )?;
@@ -234,7 +258,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
         let plan = cirrus_plans::stubs::mvr(loc, delta);
         Ok(LuaPlan {
             label: format!("mvr({}, {})", m.name, delta),
-            plan: TMutex::new(Some(plan)),
+            kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
         })
     })?;
     lua.globals().set("mvr", f)?;
@@ -244,7 +268,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
         let plan = cirrus_plans::stubs::sleep(std::time::Duration::from_secs_f64(secs));
         Ok(LuaPlan {
             label: format!("sleep({secs}s)"),
-            plan: TMutex::new(Some(plan)),
+            kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
         })
     })?;
     lua.globals().set("sleep", f)?;
@@ -254,7 +278,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
         let plan = cirrus_plans::stubs::null();
         Ok(LuaPlan {
             label: "null".into(),
-            plan: TMutex::new(Some(plan)),
+            kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
         })
     })?;
     lua.globals().set("null", f)?;
@@ -270,7 +294,9 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
     // msg.* — Msg constructors for use INSIDE coroutine plans.
     register_msg_namespace(lua)?;
 
-    // plan(fn, ...) — wrap a Lua coroutine into a Plan.
+    // plan(fn, ...) — defer Plan construction until RE:run so the
+    // bridge can capture the engine reference (needed to surface return
+    // values back to the coroutine).
     let f = lua.create_function(
         |lua, args: Variadic<LuaValue>| {
             let mut iter = args.into_iter();
@@ -287,10 +313,13 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
             };
             let rest: Vec<LuaValue> = iter.collect();
             let thread = lua.create_thread(fn_obj)?;
-            let plan = coroutine_to_plan(thread, rest);
             Ok(LuaPlan {
                 label: "coroutine".into(),
-                plan: TMutex::new(Some(plan)),
+                kind: TMutex::new(Some(LuaPlanKind::Coroutine {
+                    lua: lua.clone(),
+                    thread,
+                    args: rest,
+                })),
             })
         },
     )?;
@@ -579,28 +608,64 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
 // `mlua::Thread` is `Send` because we built the Lua state with the
 // `send` feature; no extra synchronization needed inside the stream.
 // ---------------------------------------------------------------------------
-fn coroutine_to_plan(thread: mlua::Thread, args: Vec<LuaValue>) -> Plan {
+fn coroutine_to_plan(
+    lua: Lua,
+    thread: mlua::Thread,
+    args: Vec<LuaValue>,
+    re: Arc<cirrus_engine::RunEngine>,
+) -> Plan {
     plan_box(async_stream::stream! {
         let mut started = false;
+        // Tracks the kind of the most recently yielded Msg so we can
+        // produce the right return value for the next coroutine.resume.
+        let mut last_kind: Option<MsgKind> = None;
+        // Pre-OpenRun snapshot of the engine's run uid (`None` typically),
+        // captured so the post-yield read can detect "OpenRun just
+        // succeeded" vs. "still no run open".
+        let mut prev_uid: Option<String> = None;
+
         loop {
-            let resume_args: Variadic<LuaValue> = if started {
-                Variadic::new()
-            } else {
+            // Build the resume argument from whatever the previous Msg's
+            // result was.
+            let resume_args: Variadic<LuaValue> = if !started {
                 started = true;
                 Variadic::from_iter(args.iter().cloned())
+            } else if let Some(kind) = last_kind.take() {
+                let result_value = match kind {
+                    MsgKind::OpenRun => {
+                        let now = re.current_run_uid().await;
+                        match (now, prev_uid.clone()) {
+                            (Some(uid), prev) if Some(&uid) != prev.as_ref() => {
+                                match lua.create_string(&uid) {
+                                    Ok(s) => LuaValue::String(s),
+                                    Err(_) => LuaValue::Nil,
+                                }
+                            }
+                            _ => LuaValue::Nil,
+                        }
+                    }
+                    MsgKind::Other => LuaValue::Nil,
+                };
+                Variadic::from_iter(std::iter::once(result_value))
+            } else {
+                Variadic::new()
             };
-            // Resume on the same task; Lua resume is a fast in-process
-            // call. If the script ends up doing I/O it should yield.
-            let resume_result: mlua::Result<LuaValue> =
-                thread.resume(resume_args);
+            // Capture the live UID before this resume so we can detect
+            // OpenRun completion afterwards.
+            prev_uid = re.current_run_uid().await;
+
+            let resume_result: mlua::Result<LuaValue> = thread.resume(resume_args);
             match resume_result {
                 Ok(v) => {
-                    // If the thread is still resumable, `v` is the yielded value.
-                    // If finished, the thread is in `Finished` state.
                     let still_running = thread.status() == ThreadStatus::Resumable;
                     if let LuaValue::UserData(ud) = &v {
                         if let Ok(m) = ud.borrow::<LuaMsg>() {
+                            let kind = match &m.0 {
+                                cirrus_core::msg::Msg::OpenRun(_) => MsgKind::OpenRun,
+                                _ => MsgKind::Other,
+                            };
                             yield m.0.clone();
+                            last_kind = Some(kind);
                             if !still_running {
                                 break;
                             }
@@ -608,12 +673,9 @@ fn coroutine_to_plan(thread: mlua::Thread, args: Vec<LuaValue>) -> Plan {
                         }
                     }
                     if !still_running {
-                        // Returned non-Msg — finish silently.
                         break;
                     }
-                    tracing::warn!(
-                        "coroutine plan: yielded a non-Msg value, skipping"
-                    );
+                    tracing::warn!("coroutine plan: yielded a non-Msg value, skipping");
                 }
                 Err(e) => {
                     eprintln!("coroutine plan error: {e}");
@@ -623,4 +685,12 @@ fn coroutine_to_plan(thread: mlua::Thread, args: Vec<LuaValue>) -> Plan {
             }
         }
     })
+}
+
+/// Internal: which kind of Msg we just yielded, so the bridge knows
+/// what to return to the coroutine on the next resume.
+#[derive(Copy, Clone)]
+enum MsgKind {
+    OpenRun,
+    Other,
 }
