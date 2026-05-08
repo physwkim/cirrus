@@ -3817,6 +3817,7 @@ dependencies = [
 [[package]]
 name = "tiled-client"
 version = "0.1.0"
+source = "git+https://github.com/physwkim/tiled-rs.git?branch=main#b83df7c65236f518aa471e8d8cfd5b16c3f0606e"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3854,6 +3855,7 @@ dependencies = [
 [[package]]
 name = "tiled-core"
 version = "0.1.0"
+source = "git+https://github.com/physwkim/tiled-rs.git?branch=main#b83df7c65236f518aa471e8d8cfd5b16c3f0606e"
 dependencies = [
  "arrow",
  "base64",
