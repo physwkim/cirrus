@@ -417,6 +417,7 @@ dependencies = [
  "cirrus-event-model",
  "futures",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

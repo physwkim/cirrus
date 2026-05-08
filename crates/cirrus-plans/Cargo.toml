@@ -11,3 +11,6 @@ futures.workspace = true
 serde_json.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

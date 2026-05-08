@@ -401,6 +401,62 @@ async fn stop_plan_dispatches_through_engine() {
 }
 
 #[tokio::test]
+async fn spiral_square_emits_expected_event_count() {
+    use cirrus_core::msg::MovableObj;
+    let det = SoftDetector::new("d");
+    let xm = Arc::new(SoftMotor::new("xm", Some(0.0)));
+    let ym = Arc::new(SoftMotor::new("ym", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = cirrus_plans::spiral_square(
+        vec![det as Arc<dyn cirrus_core::msg::ReadableObj>],
+        xm.clone() as Arc<dyn MovableObj>,
+        xm.clone() as Arc<dyn cirrus_core::msg::ReadableObj>,
+        ym.clone() as Arc<dyn MovableObj>,
+        ym.clone() as Arc<dyn cirrus_core::msg::ReadableObj>,
+        0.0,
+        0.0,
+        4.0,
+        4.0,
+        3,
+        3,
+    );
+    re.run_async(plan).await.unwrap();
+    let docs = sink.snapshot().await;
+    let n_events = docs
+        .iter()
+        .filter(|d| matches!(d, Document::Event(_)))
+        .count();
+    assert_eq!(n_events, 9);
+}
+
+#[tokio::test]
+async fn run_wrapper_emits_open_and_close_run() {
+    use cirrus_core::msg::ReadableObj;
+    use cirrus_plans::preprocessors::run_wrapper;
+    let det = SoftDetector::new("rwd");
+    let body = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det.clone() as Arc<dyn ReadableObj>);
+        yield cirrus_core::Msg::Save;
+    });
+    let wrapped = run_wrapper(
+        body,
+        cirrus_core::msg::RunMetadata {
+            plan_name: Some("wrapper-test".into()),
+            ..Default::default()
+        },
+    );
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(wrapped).await.unwrap();
+    let docs = sink.snapshot().await;
+    assert_eq!(docs.len(), 4);
+    assert!(matches!(docs.first(), Some(Document::Start(_))));
+    assert!(matches!(docs.last(), Some(Document::Stop(_))));
+}
+
+#[tokio::test]
 async fn sync_facade_runs_blocking_count() {
     use std::thread;
 

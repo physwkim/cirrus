@@ -2,6 +2,9 @@
 
 #![deny(missing_docs)]
 
+pub mod patterns;
+pub mod preprocessors;
+
 use cirrus_core::msg::{
     CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
     MovableObj, Msg, ReadableObj, RunMetadata, StageableObj, StoppableObj, TriggerableObj,
@@ -536,6 +539,275 @@ pub fn grid_scan(
             exit_status: "success".into(),
             reason: None,
         };
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Multi-axis & list-grid plans (mirrors bluesky.plans).
+// ---------------------------------------------------------------------------
+
+/// One axis of a multi-motor scan: `(motor, motor_reader, start, stop)`.
+pub type ScanAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
+
+/// One axis of a list-grid scan: `(motor, motor_reader, points)`.
+pub type ListGridAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
+
+/// `inner_product_scan(dets, num, [(motor1, s1, e1), ...])` — all motors move
+/// together (linspaced) for `num` points. Mirrors bluesky's
+/// `inner_product_scan` for the typical positional-only argument shape.
+pub fn inner_product_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    axes: Vec<ScanAxis>,
+) -> Plan {
+    let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
+    let pts = patterns::inner_product(num, &bounds);
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("inner_product_scan".into()),
+            ..Default::default()
+        });
+        for row in pts {
+            for (i, val) in row.iter().enumerate() {
+                yield Msg::Set {
+                    obj: axes[i].0.clone(),
+                    value: *val,
+                    group: Some("set".into()),
+                };
+            }
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            yield Msg::Create { stream_name: "primary".into() };
+            for (_, mr, _, _) in &axes {
+                yield Msg::Read(mr.clone());
+            }
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// `scan_nd(dets, motors, points)` — visit each row of `points` (shape
+/// `[N, len(motors)]`). Stripped-down `scan_nd`; bluesky's full version
+/// accepts `cycler` objects, this one takes the pre-computed list.
+pub fn scan_nd(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
+    points: Vec<Vec<f64>>,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("scan_nd".into()),
+            ..Default::default()
+        });
+        for row in points {
+            for (i, v) in row.iter().enumerate() {
+                if i >= motors.len() { break; }
+                yield Msg::Set {
+                    obj: motors[i].0.clone(),
+                    value: *v,
+                    group: Some("set".into()),
+                };
+            }
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            yield Msg::Create { stream_name: "primary".into() };
+            for (_, mr) in &motors {
+                yield Msg::Read(mr.clone());
+            }
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// `list_grid_scan(dets, [(motor, [points...]), ...])` — N-D grid where
+/// each axis traces a user-supplied list of positions.
+pub fn list_grid_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ListGridAxis>,
+) -> Plan {
+    let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
+    let pts = patterns::outer_list_product(&lists);
+    let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
+        axes.into_iter().map(|(m, r, _)| (m, r)).collect();
+    scan_nd(detectors, motors, pts)
+}
+
+/// `spiral_square(dets, x_motor, y_motor, x_center, y_center, x_range,
+/// y_range, x_num, y_num)` — visits an `x_num × y_num` grid in spiral
+/// order outward from the center.
+#[allow(clippy::too_many_arguments)]
+pub fn spiral_square(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn MovableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn MovableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_center: f64,
+    y_center: f64,
+    x_range: f64,
+    y_range: f64,
+    x_num: usize,
+    y_num: usize,
+) -> Plan {
+    let pts = patterns::spiral_square_pattern(x_center, y_center, x_range, y_range, x_num, y_num);
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("spiral_square".into()),
+            ..Default::default()
+        });
+        for (x, y) in pts {
+            yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
+            yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Read(x_reader.clone());
+            yield Msg::Read(y_reader.clone());
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// `spiral(dets, x_motor, y_motor, x_start, y_start, x_range, y_range, dr,
+/// nth)` — Archimedean spiral through `(x, y)` until the spiral exits the
+/// bounding rect. `dr` is radial increment / turn; `nth` is points / turn.
+#[allow(clippy::too_many_arguments)]
+pub fn spiral(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn MovableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn MovableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_start: f64,
+    y_start: f64,
+    x_range: f64,
+    y_range: f64,
+    dr: f64,
+    nth: usize,
+) -> Plan {
+    let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth);
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("spiral".into()),
+            ..Default::default()
+        });
+        for (x, y) in pts {
+            yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
+            yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Read(x_reader.clone());
+            yield Msg::Read(y_reader.clone());
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// `ramp_plan(go_plan, monitor_signal, take_pre_data_count, period)` —
+/// kicks off `go_plan` (a *sub-plan* that initiates a monotonic ramp,
+/// e.g. `mv(temperature, 300)`), then samples `detectors` every `period`
+/// while waiting for the ramp to land. Simplified vs bluesky's full
+/// version — no wait_for_motor_done branch; caller must interrupt.
+pub fn ramp_plan(
+    go_plan: Plan,
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    period: std::time::Duration,
+    samples: usize,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("ramp_plan".into()),
+            ..Default::default()
+        });
+        // Kick off the ramp (do not wait — go_plan should issue Set
+        // without a Wait if it wants asynchronous progress).
+        let mut go = go_plan;
+        while let Some(item) = futures::StreamExt::next(&mut go).await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+        for _ in 0..samples {
+            yield Msg::Sleep(period);
+            yield Msg::Create { stream_name: "primary".into() };
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// `rel_list_scan` — relative variant of `list_scan`. Reads each motor's
+/// readback once at the start of the plan and offsets the supplied points.
+pub fn rel_list_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn LocatableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    points: Vec<f64>,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        let bias = motor.locate_dyn().await
+            .map(|l| l.readback)
+            .unwrap_or(0.0);
+        let abs_points: Vec<f64> = points.iter().map(|p| *p + bias).collect();
+        let mv: Arc<dyn MovableObj> = motor;
+        let mut inner = list_scan(detectors, mv, motor_reader, abs_points);
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+    })
+}
+
+/// `rel_grid_scan` — relative variant of `grid_scan`. Both motors are
+/// `LocatableObj` so we can snapshot starting positions.
+#[allow(clippy::too_many_arguments)]
+pub fn rel_grid_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor1: Arc<dyn LocatableObj>,
+    motor1_reader: Arc<dyn ReadableObj>,
+    s1: f64,
+    e1: f64,
+    n1: usize,
+    motor2: Arc<dyn LocatableObj>,
+    motor2_reader: Arc<dyn ReadableObj>,
+    s2: f64,
+    e2: f64,
+    n2: usize,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        let b1 = motor1.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
+        let b2 = motor2.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
+        let m1mv: Arc<dyn MovableObj> = motor1;
+        let m2mv: Arc<dyn MovableObj> = motor2;
+        let mut inner = grid_scan(
+            detectors,
+            m1mv, motor1_reader,
+            s1 + b1, e1 + b1, n1,
+            m2mv, motor2_reader,
+            s2 + b2, e2 + b2, n2,
+        );
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
     })
 }
 
