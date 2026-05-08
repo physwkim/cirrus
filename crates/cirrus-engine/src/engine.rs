@@ -1304,6 +1304,9 @@ impl RunEngine {
                 self.broadcast(doc.as_ref()).await?;
             }
             Msg::Null => {}
+            Msg::Fail(reason) => {
+                return Err(CirrusError::Plan(reason));
+            }
             _ => {
                 tracing::warn!("ignoring unhandled Msg variant");
             }

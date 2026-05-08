@@ -80,7 +80,18 @@ impl FrameSink for BinaryFrameSink {
         let f = guard
             .as_mut()
             .ok_or_else(|| CirrusError::State("binary sink not open".into()))?;
-        let len = (frame.payload.len() as u32).to_le_bytes();
+        // CIRBIN1's per-frame length prefix is u32 LE — reject frames
+        // larger than 4 GiB explicitly rather than silently truncating
+        // (which would leave the file with a wrong length and cascade
+        // into reader corruption).
+        let len_u32: u32 = frame.payload.len().try_into().map_err(|_| {
+            CirrusError::Backend(format!(
+                "binary sink: frame too large for u32 length prefix ({} bytes; CIRBIN1 max = {})",
+                frame.payload.len(),
+                u32::MAX
+            ))
+        })?;
+        let len = len_u32.to_le_bytes();
         f.write_all(&len)
             .await
             .map_err(|e| CirrusError::Backend(format!("binary sink write len: {e}")))?;

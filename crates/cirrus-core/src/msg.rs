@@ -227,6 +227,13 @@ pub enum Msg {
     /// `MsgResult::SubscriptionId`).
     Unsubscribe(u64),
 
+    /// Abort the plan stream cleanly: the engine fails the current run
+    /// with `exit_status="fail"` and `reason = <message>`. Designed for
+    /// plan-internal abort paths (e.g. a `mvr` that lost its motor
+    /// connection mid-locate) so they can fail the run without
+    /// panicking the async task.
+    Fail(String),
+
     /// Resume after a deferred pause / suspend.
     Resume,
 
@@ -300,6 +307,7 @@ impl Msg {
                 | Msg::ReClass
                 | Msg::Subscribe(_)
                 | Msg::Unsubscribe(_)
+                | Msg::Fail(_)
                 | Msg::Null
         )
     }
@@ -420,6 +428,7 @@ impl Clone for Msg {
             Msg::ReClass => Msg::ReClass,
             Msg::Subscribe(cb) => Msg::Subscribe(cb.clone()),
             Msg::Unsubscribe(id) => Msg::Unsubscribe(*id),
+            Msg::Fail(reason) => Msg::Fail(reason.clone()),
             Msg::Resume => Msg::Resume,
             Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
                 id: *id,
@@ -474,6 +483,7 @@ impl std::fmt::Debug for Msg {
             Msg::ReClass => write!(f, "ReClass"),
             Msg::Subscribe(_) => write!(f, "Subscribe(<cb>)"),
             Msg::Unsubscribe(id) => write!(f, "Unsubscribe({id})"),
+            Msg::Fail(reason) => write!(f, "Fail({reason:?})"),
             Msg::Resume => write!(f, "Resume"),
             Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),

@@ -105,8 +105,16 @@ pub mod stubs {
     /// Motor must implement `LocatableObj` (which extends `MovableObj`).
     pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
         plan_box(async_stream::stream! {
-            let loc = motor.locate_dyn().await
-                .expect("mvr: locate_dyn failed");
+            let loc = match motor.locate_dyn().await {
+                Ok(l) => l,
+                Err(e) => {
+                    // Fail the run cleanly via Msg::Fail rather than
+                    // panicking the plan task. The engine's Fail
+                    // handler closes the run with exit_status="fail".
+                    yield Msg::Fail(format!("mvr({}): locate_dyn failed: {e}", motor.name()));
+                    return;
+                }
+            };
             let target = loc.readback + delta;
             let movable: Arc<dyn MovableObj> = motor;
             yield Msg::Set { obj: movable, value: target, group: Some("mv".into()) };

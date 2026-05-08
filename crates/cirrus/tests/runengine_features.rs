@@ -241,6 +241,41 @@ async fn unknown_custom_command_errors() {
     );
 }
 
+#[tokio::test]
+async fn msg_fail_marks_run_failed_with_reason() {
+    // Regression for R2-1: Msg::Fail aborts the plan cleanly with
+    // a Plan-level error and exit_status="fail". Used by plans like
+    // mvr to surface backend errors without panicking.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Fail("motor disconnected".into());
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail");
+
+    let docs = sink.snapshot().await;
+    let stop = docs
+        .iter()
+        .rev()
+        .find_map(|d| match d {
+            Document::Stop(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("RunStop should be emitted");
+    assert_eq!(stop.exit_status, "fail");
+    assert!(
+        stop.reason
+            .as_ref()
+            .map(|r| r.contains("motor disconnected"))
+            .unwrap_or(false),
+        "RunStop.reason must surface the Fail message; got {:?}",
+        stop.reason
+    );
+}
+
 // -- Monitor → Event flow --------------------------------------------------
 //
 // MonitorableObj has no backend impl in the crate-soft yet; we fabricate one
