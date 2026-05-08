@@ -235,6 +235,7 @@ dependencies = [
  "cirrus-protocols-sync",
  "cirrus-stream",
  "futures",
+ "serde_json",
  "tokio",
 ]
 

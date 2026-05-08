@@ -17,7 +17,7 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cirrus_core::error::{CirrusError, Result};
@@ -26,13 +26,59 @@ use cirrus_core::plan::{Plan, PlanItem};
 use cirrus_core::status::{Status, StatusError};
 use cirrus_event_model::compose::RunBundle;
 use cirrus_event_model::Document;
+use futures::future::BoxFuture;
 use futures::StreamExt;
+use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::bundler::RunBundler;
 use crate::sink::DocumentSink;
 use crate::suspender::{Suspender, SuspenderHandle};
+
+/// State the engine reports via [`RunEngine::state`]. Mirrors bluesky's
+/// `RunEngine.state` enum (idle / running / paused / aborting / halting).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EngineRunState {
+    /// Not in a `run_async` call.
+    Idle,
+    /// Inside `run_async`, the loop is processing messages.
+    Running,
+    /// Inside `run_async`, the loop is blocked at a pause gate.
+    Paused,
+    /// `abort()` has been requested; the loop is closing the run.
+    Aborting,
+    /// `halt()` has been requested; the loop is short-circuiting cleanup.
+    Halting,
+}
+
+/// Document callback signature for [`RunEngine::subscribe`].
+///
+/// Callbacks are invoked synchronously in `broadcast` order (after static
+/// `sinks`). They must be quick — slow callbacks back the engine up.
+pub type DocumentCallback = Arc<dyn Fn(&Document) + Send + Sync + 'static>;
+
+/// Stable identifier returned by [`RunEngine::subscribe`].
+pub type SubscriptionId = u64;
+
+/// Custom-command handler signature. The engine downcasts the
+/// `Msg::Custom` payload itself before invoking, so handlers receive a
+/// type they know how to interpret.
+pub type CustomCommandHandler = Arc<
+    dyn for<'a> Fn(&'a (dyn Any + Send + Sync)) -> BoxFuture<'a, Result<()>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// `RunMetadata` validator hook signature. Called once per `OpenRun` with
+/// the merged metadata (`md` + plan-supplied extras). Return `Err` to
+/// reject the run.
+pub type MdValidator = Arc<dyn Fn(&HashMap<String, Value>) -> Result<()> + Send + Sync + 'static>;
+
+/// `before_plan` / `after_plan` hook signature. Synchronous; called from
+/// inside `run_async` *outside* the message loop.
+pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Final state of a finished run.
 #[derive(Debug, Clone)]
@@ -58,12 +104,37 @@ pub struct RunEngine {
     cancel: CancellationToken,
     permit: Arc<Notify>,
     is_paused: Arc<AtomicBool>,
+    is_running: AtomicBool,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
     is_halting: AtomicBool,
     sigint_count: AtomicU8,
     suspender_count: AtomicU64,
+    sub_counter: AtomicU64,
     state: Mutex<EngineState>,
+    /// Persistent metadata, merged into every `OpenRun`. Mirrors
+    /// `bluesky.run_engine.RunEngine.md`.
+    md: StdMutex<HashMap<String, Value>>,
+    /// Auto-incrementing scan_id, bumped when a run does not supply one.
+    /// Bluesky stores this inside `md["scan_id"]`; cirrus mirrors that
+    /// behavior — every successful `OpenRun` sets `md["scan_id"] = id+1`.
+    scan_id: AtomicU64,
+    /// Dynamic Document subscribers. Inserted/removed via
+    /// `subscribe` / `unsubscribe`. Wrapped in `Arc` so spawned tasks
+    /// (monitor pumps) can re-read the live list on each tick.
+    subscribers: Arc<StdMutex<Vec<(SubscriptionId, DocumentCallback)>>>,
+    /// Custom command handlers — `RunEngine::register_command`.
+    commands: StdMutex<HashMap<String, CustomCommandHandler>>,
+    /// Optional metadata validator.
+    md_validator: StdMutex<Option<MdValidator>>,
+    /// Optional pre-plan hook.
+    before_plan: StdMutex<Option<PlanHook>>,
+    /// Optional post-plan hook.
+    after_plan: StdMutex<Option<PlanHook>>,
+    /// Optional whole-plan timeout. If set and exceeded, the loop fails
+    /// with `CirrusError::Timeout`. Mirrors bluesky's
+    /// `loop_until_completion_timeout`.
+    loop_timeout: StdMutex<Option<Duration>>,
     /// `true` if `install_signal_handler()` has run.
     signal_installed: AtomicBool,
 }
@@ -73,11 +144,26 @@ struct EngineState {
     bundler: Option<RunBundler>,
     groups: HashMap<String, WaitGroup>,
     staged: Vec<Arc<dyn cirrus_core::msg::StageableObj>>,
-    monitors: Vec<(String, Arc<dyn cirrus_core::msg::MonitorableObj>)>,
+    /// Live monitor pumps. `(stream_name, obj_name)` keyed; the `MonitorTask`
+    /// drops the `Subscription` (RAII unsubscribe) and aborts the pump on
+    /// `Drop`. Inserted by `Msg::Monitor`, removed by `Msg::Unmonitor`.
+    monitor_tasks: HashMap<String, MonitorTask>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
     rewindable: bool,
     suspenders: HashMap<u64, SuspenderHandle>,
+}
+
+/// One live monitor pump. Drops abort the pump task and (transitively)
+/// the held `Subscription`, releasing the backend slot (rule **K1**+**K2**).
+struct MonitorTask {
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for MonitorTask {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 impl RunEngine {
@@ -88,28 +174,164 @@ impl RunEngine {
             cancel: CancellationToken::new(),
             permit: Arc::new(Notify::new()),
             is_paused: Arc::new(AtomicBool::new(false)),
+            is_running: AtomicBool::new(false),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
             is_halting: AtomicBool::new(false),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
+            sub_counter: AtomicU64::new(0),
             state: Mutex::new(EngineState::default()),
+            md: StdMutex::new(HashMap::new()),
+            scan_id: AtomicU64::new(0),
+            subscribers: Arc::new(StdMutex::new(Vec::new())),
+            commands: StdMutex::new(HashMap::new()),
+            md_validator: StdMutex::new(None),
+            before_plan: StdMutex::new(None),
+            after_plan: StdMutex::new(None),
+            loop_timeout: StdMutex::new(None),
             signal_installed: AtomicBool::new(false),
         }
     }
 
     /// Async entry point — drive a plan to completion.
     pub async fn run_async(&self, plan: Plan) -> Result<RunResult> {
-        let outcome = self.run_loop(plan).await;
+        // before_plan hook — runs before is_running flips on, so it sees
+        // EngineRunState::Idle.
+        if let Some(h) = self.before_plan.lock().unwrap().clone() {
+            h();
+        }
+        self.is_running.store(true, Ordering::SeqCst);
+        // Reset abort/halt flags from a previous (terminated) run so
+        // `RunEngine` is reusable across plans.
+        self.is_aborting.store(false, Ordering::SeqCst);
+        self.is_halting.store(false, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+        let timeout = *self.loop_timeout.lock().unwrap();
+        let outcome = match timeout {
+            Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    self.cancel.cancel();
+                    Err(CirrusError::Timeout(d))
+                }
+            },
+            None => self.run_loop(plan).await,
+        };
         // Cleanup: unstage anything still staged; drop suspenders.
         let mut state = self.state.lock().await;
         let staged = std::mem::take(&mut state.staged);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
+        let _ = std::mem::take(&mut state.monitor_tasks); // K1: monitor pumps
         drop(state);
         for s in staged {
             let _ = s.unstage_dyn().await;
         }
+        self.is_running.store(false, Ordering::SeqCst);
+        if let Some(h) = self.after_plan.lock().unwrap().clone() {
+            h();
+        }
         outcome
+    }
+
+    // -- query / setters ----------------------------------------------------
+
+    /// Current engine run-state. Bluesky's `RE.state`.
+    pub fn state(&self) -> EngineRunState {
+        if self.is_halting.load(Ordering::SeqCst) {
+            return EngineRunState::Halting;
+        }
+        if self.is_aborting.load(Ordering::SeqCst) {
+            return EngineRunState::Aborting;
+        }
+        if self.is_paused.load(Ordering::SeqCst) {
+            return EngineRunState::Paused;
+        }
+        if self.is_running.load(Ordering::SeqCst) {
+            return EngineRunState::Running;
+        }
+        EngineRunState::Idle
+    }
+
+    /// Read the persistent metadata dict (`bluesky.RE.md`). Cheap clone.
+    pub fn md(&self) -> HashMap<String, Value> {
+        self.md.lock().unwrap().clone()
+    }
+
+    /// Set a single metadata key.
+    pub fn md_set(&self, key: impl Into<String>, value: Value) {
+        self.md.lock().unwrap().insert(key.into(), value);
+    }
+
+    /// Remove a metadata key.
+    pub fn md_remove(&self, key: &str) {
+        self.md.lock().unwrap().remove(key);
+    }
+
+    /// Replace the entire metadata dict (use with care).
+    pub fn md_replace(&self, md: HashMap<String, Value>) {
+        *self.md.lock().unwrap() = md;
+    }
+
+    /// Subscribe a Document callback. Returns a [`SubscriptionId`]; pair
+    /// with `unsubscribe(id)` to remove.
+    pub fn subscribe(&self, cb: DocumentCallback) -> SubscriptionId {
+        let id = self.sub_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.subscribers.lock().unwrap().push((id, cb));
+        id
+    }
+
+    /// Remove a subscriber by id. No-op if the id is unknown.
+    pub fn unsubscribe(&self, id: SubscriptionId) {
+        self.subscribers.lock().unwrap().retain(|(i, _)| *i != id);
+    }
+
+    /// Register a custom command handler. Plans yielding
+    /// `Msg::Custom { name, payload }` route to the handler whose name
+    /// matches; the payload is passed as `&dyn Any`.
+    pub fn register_command(&self, name: impl Into<String>, handler: CustomCommandHandler) {
+        self.commands.lock().unwrap().insert(name.into(), handler);
+    }
+
+    /// Remove a custom command handler.
+    pub fn unregister_command(&self, name: &str) {
+        self.commands.lock().unwrap().remove(name);
+    }
+
+    /// Install a metadata validator. Called once per `OpenRun` *after*
+    /// `md` is merged with the plan's `RunMetadata.extra`. Return `Err`
+    /// to reject the run.
+    pub fn set_md_validator(&self, v: Option<MdValidator>) {
+        *self.md_validator.lock().unwrap() = v;
+    }
+
+    /// Hook fired before each `run_async`, *before* the engine flips into
+    /// `Running` state.
+    pub fn set_before_plan(&self, h: Option<PlanHook>) {
+        *self.before_plan.lock().unwrap() = h;
+    }
+
+    /// Hook fired after each `run_async`, after cleanup.
+    pub fn set_after_plan(&self, h: Option<PlanHook>) {
+        *self.after_plan.lock().unwrap() = h;
+    }
+
+    /// Set an overall plan timeout (bluesky `loop_until_completion_timeout`).
+    /// `None` = no timeout (default).
+    pub fn set_loop_timeout(&self, t: Option<Duration>) {
+        *self.loop_timeout.lock().unwrap() = t;
+    }
+
+    /// Synonym for [`pause`]. Mirrors bluesky's `RE.request_pause`.
+    pub fn request_pause(&self, defer: bool) {
+        self.pause(defer);
+    }
+
+    /// External nudge: ask the engine to suspend (treated as `abort` for
+    /// now — no async-resume hook here; pair with a `Suspender` if you
+    /// want a *resume-when-condition* pattern).
+    pub fn request_suspend(&self, reason: impl Into<String>) {
+        self.abort(reason);
     }
 
     /// Sync entry point — drive a plan via the cirrus runtime.
@@ -317,7 +539,7 @@ impl RunEngine {
         // Suspend monitors (drop them; they'll be re-installed on resume by
         // re-issuing Monitor messages from the cache, if any).
         let mut state = self.state.lock().await;
-        state.monitors.clear();
+        state.monitor_tasks.clear();
     }
 
     async fn on_resume(&self) {
@@ -463,15 +685,14 @@ impl RunEngine {
                 }
             }
             Msg::Monitor { obj, name } => {
-                let _sub = obj.subscribe_dyn().await?;
-                let stream = name.unwrap_or_else(|| "primary".into());
-                self.state.lock().await.monitors.push((stream, obj));
+                let stream = name.unwrap_or_else(|| obj.name().to_string());
+                self.start_monitor(stream, obj).await?;
             }
             Msg::Unmonitor(obj) => {
+                // Remove the monitor task whose key matches obj.name(). The
+                // MonitorTask Drop aborts the pump and the held Subscription.
                 let mut state = self.state.lock().await;
-                state.monitors.retain(|(_, o)| {
-                    !Arc::ptr_eq(&(o.clone() as Arc<_>), &(obj.clone() as Arc<_>))
-                });
+                state.monitor_tasks.retain(|stream, _| stream != obj.name());
             }
             Msg::Wait {
                 group,
@@ -522,8 +743,21 @@ impl RunEngine {
             Msg::Configure { obj, args } => {
                 obj.configure_dyn(args).await?;
             }
-            Msg::Custom { name, .. } => {
-                tracing::warn!("ignoring unknown custom Msg: {name}");
+            Msg::Custom { name, payload } => {
+                let handler = self.commands.lock().unwrap().get(name).cloned();
+                match handler {
+                    Some(h) => {
+                        h(payload.as_ref()).await?;
+                    }
+                    None => {
+                        return Err(CirrusError::Plan(format!(
+                            "unknown custom command: {name}"
+                        )));
+                    }
+                }
+            }
+            Msg::Publish(doc) => {
+                self.broadcast(doc.as_ref()).await?;
             }
             Msg::Null => {}
             _ => {
@@ -531,6 +765,79 @@ impl RunEngine {
             }
         }
         Ok(None)
+    }
+
+    async fn start_monitor(
+        &self,
+        stream: String,
+        obj: Arc<dyn cirrus_core::msg::MonitorableObj>,
+    ) -> Result<()> {
+        // Step 1: declare the descriptor for this stream from the device's
+        // own describe_dyn (MonitorableObj : ReadableObj).
+        let data_keys = obj.describe_dyn().await?;
+        let (descriptor, bundle) = {
+            let mut state = self.state.lock().await;
+            let bundler = state
+                .bundler
+                .as_mut()
+                .ok_or_else(|| CirrusError::Plan("Monitor with no open run".into()))?;
+            let descriptor = if bundler.descriptor_uid(&stream).is_some() {
+                None
+            } else {
+                Some(bundler.declare_stream(stream.clone(), data_keys.clone())?)
+            };
+            (descriptor, bundler.bundle())
+        };
+        if let Some(d) = descriptor {
+            self.broadcast(&Document::Descriptor(d)).await?;
+        }
+
+        // Step 2: subscribe + spawn a pump that emits one Event per rx tick.
+        let mut sub = obj.subscribe_dyn().await?;
+        let stream_for_task = stream.clone();
+        let obj_name = obj.name().to_string();
+        let sinks = self.sinks.clone();
+        let subs_arc = self.subscribers.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let reading = {
+                    let r = sub.rx_mut();
+                    if r.changed().await.is_err() {
+                        return;
+                    }
+                    r.borrow_and_update().clone()
+                };
+                let mut data = HashMap::new();
+                let mut timestamps = HashMap::new();
+                data.insert(obj_name.clone(), reading.value);
+                timestamps.insert(obj_name.clone(), reading.timestamp);
+                let ev = match bundle.event(&stream_for_task, data, timestamps) {
+                    Some(ev) => ev,
+                    None => continue,
+                };
+                let doc = Document::Event(ev);
+                for s in &sinks {
+                    let _ = s.dispatch(&doc).await;
+                }
+                let snapshot: Vec<DocumentCallback> = subs_arc
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, cb)| cb.clone())
+                    .collect();
+                for cb in snapshot {
+                    cb(&doc);
+                }
+            }
+        });
+        let abort = handle.abort_handle();
+        self.state
+            .lock()
+            .await
+            .monitor_tasks
+            .insert(stream, MonitorTask { abort });
+        Ok(())
     }
 
     /// Allocate a fresh suspender id.
@@ -566,14 +873,37 @@ impl RunEngine {
     }
 
     async fn open_run(&self, meta: RunMetadata) -> Result<String> {
-        let mut start_doc = RunBundle::start(meta.scan_id, None);
-        for (k, v) in meta.extra {
-            start_doc.extra.insert(k, v);
+        // Resolve scan_id: caller-supplied wins; otherwise auto-increment.
+        let scan_id = match meta.scan_id {
+            Some(s) => {
+                self.scan_id.store(s, Ordering::SeqCst);
+                Some(s)
+            }
+            None => Some(self.scan_id.fetch_add(1, Ordering::SeqCst) + 1),
+        };
+        let mut start_doc = RunBundle::start(scan_id, None);
+        // Merge persistent metadata (`md`) first, then per-run extras override.
+        let merged: HashMap<String, Value> = {
+            let mut m = self.md.lock().unwrap().clone();
+            for (k, v) in &meta.extra {
+                m.insert(k.clone(), v.clone());
+            }
+            if let Some(scan_id) = scan_id {
+                m.entry("scan_id".into())
+                    .or_insert(Value::from(scan_id));
+            }
+            if let Some(ref pn) = meta.plan_name {
+                m.entry("plan_name".into())
+                    .or_insert(Value::String(pn.clone()));
+            }
+            m
+        };
+        // Validator hook.
+        if let Some(v) = self.md_validator.lock().unwrap().clone() {
+            v(&merged)?;
         }
-        if let Some(plan_name) = meta.plan_name {
-            start_doc
-                .extra
-                .insert("plan_name".into(), serde_json::Value::String(plan_name));
+        for (k, v) in merged {
+            start_doc.extra.insert(k, v);
         }
         let bundle = Arc::new(RunBundle::open(&start_doc));
         let uid = start_doc.uid.clone();
@@ -605,6 +935,20 @@ impl RunEngine {
     async fn broadcast(&self, doc: &Document) -> Result<()> {
         for s in &self.sinks {
             let _ = s.dispatch(doc).await;
+        }
+        // Dynamic subscribers — clone the callback Arcs out of the lock so the
+        // lock isn't held across user code. Each callback is invoked
+        // synchronously; lossless w.r.t. order, but slow callbacks back
+        // the engine up. (Use a buffering callback if you need decoupling.)
+        let subs: Vec<DocumentCallback> = self
+            .subscribers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, cb)| cb.clone())
+            .collect();
+        for cb in subs {
+            cb(doc);
         }
         Ok(())
     }

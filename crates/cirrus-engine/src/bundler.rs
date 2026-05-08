@@ -184,6 +184,14 @@ impl RunBundler {
         &self.bundle
     }
 
+    /// Clone the underlying `RunBundle` for use in spawned tasks (monitor
+    /// pumps, etc.) that need to compose Events for *already-declared*
+    /// streams. The pump must not race with `Save` / `Drop` for the
+    /// primary bundle.
+    pub fn bundle(&self) -> Arc<RunBundle> {
+        self.bundle.clone()
+    }
+
     /// Look up an already-emitted descriptor UID.
     pub fn descriptor_uid(&self, stream_name: &str) -> Option<String> {
         self.descriptors

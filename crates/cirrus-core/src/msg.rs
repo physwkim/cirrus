@@ -180,13 +180,20 @@ pub enum Msg {
     /// `Msg('rewindable', None, bool)`.
     Rewindable(bool),
 
-    /// Custom user command.
+    /// Custom user command. Dispatched via `RunEngine::register_command`.
     Custom {
         /// Command name.
         name: &'static str,
         /// Opaque payload.
         payload: Box<dyn Any + Send + Sync>,
     },
+
+    /// Publish a pre-built `Document` directly through the engine's sinks
+    /// and dynamic subscribers. Escape hatch for detector writers and
+    /// other producers of `Resource`, `Datum`, `StreamResource`,
+    /// `StreamDatum`, `EventPage`, or `DatumPage` documents that the
+    /// standard `Read` / `Save` / `Collect` path does not construct.
+    Publish(Box<cirrus_event_model::Document>),
 
     /// No-op message — useful for spinning the loop.
     Null,
@@ -216,6 +223,7 @@ impl Msg {
                 | Msg::RemoveSuspender { .. }
                 | Msg::Rewindable(_)
                 | Msg::Custom { .. }
+                | Msg::Publish(_)
                 | Msg::Null
         )
     }
@@ -307,6 +315,7 @@ impl Clone for Msg {
             // `is_cacheable()` returns false for `Custom`, so this branch is
             // unreachable from the rewind path.
             Msg::Custom { .. } => Msg::Null,
+            Msg::Publish(d) => Msg::Publish(d.clone()),
             Msg::Null => Msg::Null,
         }
     }
@@ -343,8 +352,25 @@ impl std::fmt::Debug for Msg {
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),
             Msg::Rewindable(b) => write!(f, "Rewindable({b})"),
             Msg::Custom { name, .. } => write!(f, "Custom({name})"),
+            Msg::Publish(d) => write!(f, "Publish({})", document_label(d)),
             Msg::Null => write!(f, "Null"),
         }
+    }
+}
+
+fn document_label(d: &cirrus_event_model::Document) -> &'static str {
+    use cirrus_event_model::Document::*;
+    match d {
+        Start(_) => "RunStart",
+        Descriptor(_) => "EventDescriptor",
+        Event(_) => "Event",
+        EventPage(_) => "EventPage",
+        Resource(_) => "Resource",
+        Datum(_) => "Datum",
+        DatumPage(_) => "DatumPage",
+        StreamResource(_) => "StreamResource",
+        StreamDatum(_) => "StreamDatum",
+        Stop(_) => "RunStop",
     }
 }
 
@@ -453,9 +479,12 @@ pub trait CollectableObj: NamedObj {
     >;
 }
 
-/// Anything that can be subscribed to (monitor stream).
+/// Anything that can be subscribed to (monitor stream). A monitorable
+/// object is also `Readable`: the engine uses `describe_dyn` / `read_dyn`
+/// to get the data keys for the monitor stream's `EventDescriptor`, and
+/// to seed the first Event before any rx-side updates arrive.
 #[async_trait::async_trait]
-pub trait MonitorableObj: NamedObj {
+pub trait MonitorableObj: ReadableObj {
     /// Subscribe — engine receives a `Subscription` (rx + RAII token).
     async fn subscribe_dyn(
         &self,

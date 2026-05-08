@@ -8,6 +8,9 @@ pub mod sink;
 pub mod suspender;
 
 pub use bundler::RunBundler;
-pub use engine::{RunEngine, RunResult, SuspendCallback};
+pub use engine::{
+    CustomCommandHandler, DocumentCallback, EngineRunState, MdValidator, PlanHook, RunEngine,
+    RunResult, SubscriptionId, SuspendCallback,
+};
 pub use sink::{BroadcastSink, DocumentSink};
 pub use suspender::Suspender;

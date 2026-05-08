@@ -11,11 +11,20 @@ use cirrus_engine::{DocumentSink, RunEngine};
 use cirrus_event_model::Document;
 
 fn rand_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    // Combine a monotonically-incrementing counter with the wall-clock
+    // nanos so two tests scheduled within the same nanosecond still get
+    // distinct ids. Without the counter, parallel test runs occasionally
+    // collide on the IPC socket path and the second test fails with
+    // "Address already in use".
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64
+        .as_nanos() as u64;
+    nanos.wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// Wait until the PUB socket has at least one connected peer that has
