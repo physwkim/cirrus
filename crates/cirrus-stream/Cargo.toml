@@ -1,0 +1,18 @@
+[package]
+name = "cirrus-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FrameSource/Sink + FramePipe + reference sources/sinks."
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+cirrus-core.workspace = true
+cirrus-event-model.workspace = true
+cirrus-protocols-async.workspace = true

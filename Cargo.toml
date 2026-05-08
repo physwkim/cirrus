@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+default-members = [
+    "crates/cirrus",
+    "crates/cirrus-cli",
+]
+members = [
+    "crates/cirrus-event-model",
+    "crates/cirrus-core",
+    "crates/cirrus-protocols-async",
+    "crates/cirrus-protocols-sync",
+    "crates/cirrus-engine",
+    "crates/cirrus-plans",
+    "crates/cirrus-devices",
+    "crates/cirrus-backends/soft",
+    "crates/cirrus-backends/mock",
+    "crates/cirrus-backends/epics-ca",
+    "crates/cirrus-backends/epics-pva",
+    "crates/cirrus-stream",
+    "crates/cirrus-callbacks",
+    "crates/cirrus",
+    "crates/cirrus-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "BSD-3-Clause"
+repository = "https://github.com/stevek/cirrus"
+
+[workspace.dependencies]
+# core deps
+async-trait = "0.1"
+async-stream = "0.3"
+bytes = "1"
+futures = "0.3"
+pin-project-lite = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# internal
+cirrus-event-model    = { path = "crates/cirrus-event-model" }
+cirrus-core           = { path = "crates/cirrus-core" }
+cirrus-protocols-async = { path = "crates/cirrus-protocols-async" }
+cirrus-protocols-sync  = { path = "crates/cirrus-protocols-sync" }
+cirrus-engine         = { path = "crates/cirrus-engine" }
+cirrus-plans          = { path = "crates/cirrus-plans" }
+cirrus-devices        = { path = "crates/cirrus-devices" }
+cirrus-backend-soft   = { path = "crates/cirrus-backends/soft" }
+cirrus-backend-mock   = { path = "crates/cirrus-backends/mock" }
+cirrus-stream         = { path = "crates/cirrus-stream" }
+cirrus-callbacks      = { path = "crates/cirrus-callbacks" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"

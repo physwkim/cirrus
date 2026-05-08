@@ -1,0 +1,17 @@
+[package]
+name = "cirrus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cirrus REPL / CLI."
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+cirrus-core.workspace = true
+cirrus-engine.workspace = true
+cirrus-callbacks.workspace = true
+
+[[bin]]
+name = "cirrus"
+path = "src/main.rs"

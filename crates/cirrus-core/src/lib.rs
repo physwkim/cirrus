@@ -1,0 +1,23 @@
+//! cirrus-core — foundational types: `Reading`, `Status`, `Msg`, `Plan`, runtime.
+
+#![deny(missing_docs)]
+
+pub mod error;
+pub mod kind;
+pub mod msg;
+pub mod plan;
+pub mod reading;
+pub mod runtime;
+pub mod status;
+
+pub use error::{CirrusError, Result};
+pub use kind::Kind;
+pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata};
+pub use plan::{plan_box, Plan, PlanItem};
+pub use reading::{ReadingF64, ReadingValue, TypedReading};
+pub use runtime::{cirrus_runtime, runtime_handle};
+pub use status::{Status, StatusError, StatusOutcome, SubToken};
+
+// re-export selected event-model types so devices/plans don't have to
+// depend on cirrus-event-model directly.
+pub use cirrus_event_model::{DataKey, Document, Dtype};

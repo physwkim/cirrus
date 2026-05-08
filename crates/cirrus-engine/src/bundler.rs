@@ -1,0 +1,197 @@
+//! `RunBundler` — owns per-run state, emits descriptors and events as plans
+//! call `create / read / save` etc.
+
+use cirrus_core::error::{CirrusError, Result};
+use cirrus_core::reading::ReadingValue;
+use cirrus_event_model::compose::RunBundle;
+use cirrus_event_model::{Configuration, DataKey, Document, EventDescriptor, PerObjectHint};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// State of one open bundle (between `create` and `save`/`drop`).
+struct OpenBundle {
+    stream_name: String,
+    readings: HashMap<String, ReadingValue>,
+}
+
+/// Per-stream descriptor cache entry.
+#[derive(Clone, Default)]
+struct DescriptorState {
+    uid: String,
+}
+
+/// Per-run bundler. Lives inside the RunEngine.
+pub struct RunBundler {
+    bundle: Arc<RunBundle>,
+    /// Per-stream descriptor cache, keyed by stream name.
+    descriptors: HashMap<String, DescriptorState>,
+    /// Per-stream accumulated data keys (populated as Read messages arrive).
+    stream_data_keys: HashMap<String, HashMap<String, DataKey>>,
+    /// Currently open event bundle, if any.
+    open: Option<OpenBundle>,
+    /// Run start UID.
+    pub start_uid: String,
+    /// Configuration accumulated for the next descriptor.
+    pending_config: HashMap<String, Configuration>,
+    /// Object → fields hint accumulator.
+    pending_hints: Option<HashMap<String, PerObjectHint>>,
+    /// Object → field-list mapping accumulated for descriptors.
+    pending_object_keys: HashMap<String, Vec<String>>,
+}
+
+impl RunBundler {
+    /// Build with an existing run-start UID and a shared `RunBundle`.
+    pub fn new(bundle: Arc<RunBundle>) -> Self {
+        Self {
+            start_uid: bundle.start_uid().to_string(),
+            bundle,
+            descriptors: HashMap::new(),
+            stream_data_keys: HashMap::new(),
+            open: None,
+            pending_config: HashMap::new(),
+            pending_hints: None,
+            pending_object_keys: HashMap::new(),
+        }
+    }
+
+    /// Begin a new event bundle for `stream_name`.
+    pub fn create(&mut self, stream_name: String) -> Result<()> {
+        if self.open.is_some() {
+            return Err(CirrusError::Plan(
+                "create called while a previous bundle is still open".into(),
+            ));
+        }
+        self.open = Some(OpenBundle {
+            stream_name,
+            readings: HashMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Add readings (from a single `Read` of one device) to the open bundle.
+    pub fn add_readings(
+        &mut self,
+        readings: HashMap<String, ReadingValue>,
+        data_keys: HashMap<String, DataKey>,
+        object_name: Option<String>,
+        hint_fields: Option<Vec<String>>,
+    ) -> Result<()> {
+        let bundle = self
+            .open
+            .as_mut()
+            .ok_or_else(|| CirrusError::Plan("read with no open bundle".into()))?;
+        let stream_name = bundle.stream_name.clone();
+        for (k, v) in readings {
+            bundle.readings.insert(k, v);
+        }
+        // Stash data keys for descriptor synthesis at save time.
+        let s = self
+            .stream_data_keys
+            .entry(stream_name)
+            .or_default();
+        for (k, v) in data_keys {
+            s.insert(k, v);
+        }
+        // Hints + object_keys
+        if let (Some(obj), Some(fields)) = (object_name, hint_fields) {
+            self.pending_object_keys.insert(obj.clone(), fields.clone());
+            let hint_map = self.pending_hints.get_or_insert_with(HashMap::new);
+            hint_map.entry(obj).or_default().fields = Some(fields);
+        }
+        Ok(())
+    }
+
+    /// Save the open bundle as documents. Emits a Descriptor on first save
+    /// per stream, then an Event.
+    pub fn save(&mut self) -> Result<Vec<Document>> {
+        let bundle = self
+            .open
+            .take()
+            .ok_or_else(|| CirrusError::Plan("save with no open bundle".into()))?;
+        let stream_name = bundle.stream_name.clone();
+        let mut out = Vec::new();
+
+        let needs_descriptor = self
+            .descriptors
+            .get(&stream_name)
+            .map(|d| d.uid.is_empty())
+            .unwrap_or(true);
+        if needs_descriptor {
+            let data_keys = self
+                .stream_data_keys
+                .get(&stream_name)
+                .cloned()
+                .unwrap_or_default();
+            let (descriptor, _new) = self.bundle.descriptor(
+                &stream_name,
+                data_keys,
+                std::mem::take(&mut self.pending_config),
+                std::mem::take(&mut self.pending_hints),
+                std::mem::take(&mut self.pending_object_keys),
+            );
+            self.descriptors.insert(
+                stream_name.clone(),
+                DescriptorState {
+                    uid: descriptor.uid.clone(),
+                },
+            );
+            out.push(Document::Descriptor(descriptor));
+        }
+
+        let mut data = HashMap::new();
+        let mut timestamps = HashMap::new();
+        for (k, r) in bundle.readings {
+            data.insert(k.clone(), r.value);
+            timestamps.insert(k, r.timestamp);
+        }
+        let ev = self
+            .bundle
+            .event(&stream_name, data, timestamps)
+            .ok_or_else(|| CirrusError::Plan("event for unknown stream".into()))?;
+        out.push(Document::Event(ev));
+        Ok(out)
+    }
+
+    /// Discard the open bundle.
+    pub fn drop_bundle(&mut self) -> Result<()> {
+        if self.open.take().is_none() {
+            return Err(CirrusError::Plan("drop with no open bundle".into()));
+        }
+        Ok(())
+    }
+
+    /// Pre-declare a stream (fly scans).
+    pub fn declare_stream(
+        &mut self,
+        stream_name: String,
+        data_keys: HashMap<String, DataKey>,
+    ) -> Result<EventDescriptor> {
+        let (descriptor, _new) = self.bundle.descriptor(
+            &stream_name,
+            data_keys,
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        self.descriptors.insert(
+            stream_name,
+            DescriptorState {
+                uid: descriptor.uid.clone(),
+            },
+        );
+        Ok(descriptor)
+    }
+
+    /// Underlying compose handle.
+    pub fn compose(&self) -> &RunBundle {
+        &self.bundle
+    }
+
+    /// Look up an already-emitted descriptor UID.
+    pub fn descriptor_uid(&self, stream_name: &str) -> Option<String> {
+        self.descriptors
+            .get(stream_name)
+            .map(|d| d.uid.clone())
+            .filter(|s| !s.is_empty())
+    }
+}
