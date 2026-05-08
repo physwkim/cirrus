@@ -7,12 +7,11 @@ use cirrus_callbacks::ZmqDocumentSink;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::msg::RunMetadata;
 use cirrus_engine::{DocumentSink, RunEngine};
-use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
-use crate::methods::{codes, RpcRequest, RpcResponse};
-use crate::queue::{PlanQueue, QueuedItem};
+use crate::dispatch::dispatch;
+use crate::queue::PlanQueue;
 use crate::registry::Registry;
 use crate::state::{EState, EngineState};
 use crate::transport::ReqRepSocket;
@@ -209,207 +208,7 @@ fn rep_loop(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch(
-    rt: &tokio::runtime::Handle,
-    req: &RpcRequest,
-    registry: Arc<Registry>,
-    queue: Arc<StdMutex<PlanQueue>>,
-    state: Arc<StdMutex<EngineState>>,
-    engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
-    document_sink: Option<Arc<dyn DocumentSink>>,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
-) -> RpcResponse {
-    let id = req.id.clone();
-    match req.method.as_str() {
-        "ping" => RpcResponse::ok(id, json!({"success": true, "msg": "pong"})),
-
-        "status" => {
-            let mut st = state.lock().unwrap().clone();
-            st.queue_len = queue.lock().unwrap().len();
-            RpcResponse::ok(
-                id,
-                json!({
-                    "success": true,
-                    "msg": "",
-                    "manager_state": st.state.map(|s| s.as_str()).unwrap_or("environment_closed"),
-                    "items_in_queue": st.queue_len,
-                    "running_item_uid": st.current_run_uid,
-                    "running_item_name": st.current_plan_name,
-                    "plans_run": st.plans_run,
-                    "plans_failed": st.plans_failed,
-                }),
-            )
-        }
-
-        "environment_open" => {
-            let mut e = rt.block_on(engine.lock());
-            if e.is_some() {
-                return RpcResponse::err(id, codes::QSERVER, "environment already open");
-            }
-            let sinks: Vec<Arc<dyn DocumentSink>> = document_sink.iter().cloned().collect();
-            *e = Some(Arc::new(RunEngine::new(sinks)));
-            state.lock().unwrap().state = Some(EState::Idle);
-            RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-        }
-
-        "environment_close" => {
-            let mut e = rt.block_on(engine.lock());
-            if e.is_none() {
-                return RpcResponse::err(id, codes::QSERVER, "no environment");
-            }
-            *e = None;
-            state.lock().unwrap().state = Some(EState::EnvironmentClosed);
-            RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-        }
-
-        "queue_item_add" => {
-            let item = match req.params.get("item") {
-                Some(it) => it.clone(),
-                None => return RpcResponse::err(id, codes::INVALID_PARAMS, "missing 'item'"),
-            };
-            let name = match item.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n.to_string(),
-                None => return RpcResponse::err(id, codes::INVALID_PARAMS, "item.name required"),
-            };
-            if registry.plan(&name).is_none() {
-                return RpcResponse::err(id, codes::QSERVER, format!("unknown plan: {name}"));
-            }
-            let queued = QueuedItem::plan(name, item);
-            let item_uid = queued.item_uid.clone();
-            queue.lock().unwrap().push_back(queued);
-            RpcResponse::ok(
-                id,
-                json!({"success": true, "msg": "", "qsize": queue.lock().unwrap().len(), "item_uid": item_uid}),
-            )
-        }
-
-        "queue_item_remove" => {
-            let uid = match req.params.get("uid").and_then(|v| v.as_str()) {
-                Some(u) => u.to_string(),
-                None => return RpcResponse::err(id, codes::INVALID_PARAMS, "uid required"),
-            };
-            let removed = queue.lock().unwrap().remove_by_uid(&uid);
-            match removed {
-                Some(i) => RpcResponse::ok(
-                    id,
-                    json!({"success": true, "msg": "", "item": serde_json::to_value(&i).unwrap()}),
-                ),
-                None => RpcResponse::err(id, codes::QSERVER, format!("uid not found: {uid}")),
-            }
-        }
-
-        "queue_get" => {
-            let snap = queue.lock().unwrap().snapshot();
-            RpcResponse::ok(
-                id,
-                json!({"success": true, "msg": "", "items": snap, "running_item": Value::Null}),
-            )
-        }
-
-        "queue_start" => {
-            let e_guard = rt.block_on(engine.lock());
-            let re = match e_guard.as_ref() {
-                Some(r) => r.clone(),
-                None => return RpcResponse::err(id, codes::QSERVER, "environment not open"),
-            };
-            drop(e_guard);
-            let cur_state = state.lock().unwrap().state;
-            if cur_state != Some(EState::Idle) {
-                return RpcResponse::err(
-                    id,
-                    codes::QSERVER,
-                    format!("cannot start in state {:?}", cur_state),
-                );
-            }
-            let registry = registry.clone();
-            let queue = queue.clone();
-            let state = state.clone();
-            let task_slot = queue_task.clone();
-            let join = tokio::spawn(execute_queue_loop(
-                re,
-                registry,
-                queue,
-                state,
-                task_slot.clone(),
-            ));
-            *task_slot.lock().unwrap() = Some(join.abort_handle());
-            RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-        }
-
-        "re_pause" => {
-            let e_guard = rt.block_on(engine.lock());
-            if let Some(re) = e_guard.as_ref() {
-                let defer = req
-                    .params
-                    .get("option")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == "deferred")
-                    .unwrap_or(false);
-                re.pause(defer);
-                RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-            } else {
-                RpcResponse::err(id, codes::QSERVER, "no environment")
-            }
-        }
-
-        "re_resume" => {
-            let e_guard = rt.block_on(engine.lock());
-            if let Some(re) = e_guard.as_ref() {
-                re.resume();
-                RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-            } else {
-                RpcResponse::err(id, codes::QSERVER, "no environment")
-            }
-        }
-
-        "re_abort" => {
-            let e_guard = rt.block_on(engine.lock());
-            if let Some(re) = e_guard.as_ref() {
-                re.abort("user abort");
-                state.lock().unwrap().state = Some(EState::Aborting);
-                RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-            } else {
-                RpcResponse::err(id, codes::QSERVER, "no environment")
-            }
-        }
-
-        "re_halt" => {
-            let e_guard = rt.block_on(engine.lock());
-            if let Some(re) = e_guard.as_ref() {
-                re.halt("user halt");
-                state.lock().unwrap().state = Some(EState::Aborting);
-                RpcResponse::ok(id, json!({"success": true, "msg": ""}))
-            } else {
-                RpcResponse::err(id, codes::QSERVER, "no environment")
-            }
-        }
-
-        "plans_allowed" => RpcResponse::ok(
-            id,
-            json!({
-                "success": true,
-                "msg": "",
-                "plans_allowed": registry.plan_names(),
-                "plans_allowed_uid": "static",
-            }),
-        ),
-
-        "devices_allowed" => RpcResponse::ok(
-            id,
-            json!({
-                "success": true,
-                "msg": "",
-                "devices_allowed": registry.device_names(),
-                "devices_allowed_uid": "static",
-            }),
-        ),
-
-        m => RpcResponse::err(id, codes::METHOD_NOT_FOUND, format!("unknown method: {m}")),
-    }
-}
-
-async fn execute_queue_loop(
+pub(crate) async fn execute_queue_loop(
     re: Arc<RunEngine>,
     registry: Arc<Registry>,
     queue: Arc<StdMutex<PlanQueue>>,
@@ -420,6 +219,13 @@ async fn execute_queue_loop(
     // worker" and a future shutdown does not abort an unrelated handle.
     let _slot_guard = ClearOnDrop(task_slot.clone());
     loop {
+        // Honor queue_stop_pending: drain to idle without running the next item.
+        if state.lock().unwrap().queue_stop_pending {
+            let mut s = state.lock().unwrap();
+            s.queue_stop_pending = false;
+            s.state = Some(EState::Idle);
+            return;
+        }
         let item = queue.lock().unwrap().pop_front();
         let item = match item {
             Some(it) => it,
@@ -437,7 +243,14 @@ async fn execute_queue_loop(
             Some(f) => f.clone(),
             None => {
                 tracing::error!("queue: unknown plan {}", item.name);
-                state.lock().unwrap().plans_failed += 1;
+                let mut s = state.lock().unwrap();
+                s.plans_failed += 1;
+                let archived = item.clone().with_result(serde_json::json!({
+                    "exit_status": "fail",
+                    "reason": "unknown plan",
+                }));
+                drop(s);
+                queue.lock().unwrap().push_history(archived);
                 continue;
             }
         };
@@ -445,36 +258,68 @@ async fn execute_queue_loop(
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("queue: plan {} build failed: {e}", item.name);
-                state.lock().unwrap().plans_failed += 1;
+                let mut s = state.lock().unwrap();
+                s.plans_failed += 1;
+                let archived = item.clone().with_result(serde_json::json!({
+                    "exit_status": "fail",
+                    "reason": format!("plan build failed: {e}"),
+                }));
+                drop(s);
+                queue.lock().unwrap().push_history(archived);
                 continue;
             }
         };
-        // Wrap the plan with an OpenRun envelope using the queued item meta.
         let _ = item.meta;
         let _meta = RunMetadata {
             scan_id: None,
             plan_name: Some(item.name.clone()),
             extra: Default::default(),
         };
-        match re.run_async(plan).await {
-            Ok(result) => {
-                let mut s = state.lock().unwrap();
-                s.plans_run += 1;
-                s.current_run_uid = result.run_uid;
-                s.current_plan_name = None;
-                if result.exit_status == "abort" || result.exit_status == "fail" {
-                    s.plans_failed += 1;
-                    s.state = Some(EState::Idle);
-                    return;
+        let run_result = re.run_async(plan).await;
+        let exit_status = match &run_result {
+            Ok(r) => r.exit_status.clone(),
+            Err(_) => "fail".to_string(),
+        };
+        let run_uid = run_result.as_ref().ok().and_then(|r| r.run_uid.clone());
+        // Bookkeeping after the run.
+        {
+            let mut s = state.lock().unwrap();
+            s.plans_run += 1;
+            s.current_run_uid = run_uid.clone();
+            s.current_plan_name = None;
+            if let Some(uid) = &run_uid {
+                s.re_runs.push(uid.clone());
+                if s.re_runs.len() > 64 {
+                    let drop_n = s.re_runs.len() - 64;
+                    s.re_runs.drain(0..drop_n);
                 }
             }
-            Err(e) => {
-                tracing::error!("plan {} failed: {e}", item.name);
-                let mut s = state.lock().unwrap();
+            if exit_status == "abort" || exit_status == "fail" || exit_status == "halt" {
                 s.plans_failed += 1;
-                s.state = Some(EState::Idle);
-                return;
             }
+        }
+        // Archive the item with its result.
+        let archived = item.clone().with_result(serde_json::json!({
+            "exit_status": exit_status,
+            "run_uid": run_uid,
+        }));
+        queue.lock().unwrap().push_history(archived);
+        // Loop mode: re-enqueue at the back (bluesky's "loop" plan_queue_mode).
+        if state
+            .lock()
+            .unwrap()
+            .queue_mode
+            .get("loop")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            queue.lock().unwrap().push_back(item);
+        }
+        // On non-success, idle out (matches bluesky behaviour: queue_start
+        // halts on error).
+        if exit_status != "success" {
+            state.lock().unwrap().state = Some(EState::Idle);
+            return;
         }
     }
 }

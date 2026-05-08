@@ -9,22 +9,39 @@
 //! CLI, web UI) connect at the same `tcp://*:60615` endpoint and speak the
 //! same protocol.
 //!
-//! ## What's implemented
+//! ## What's implemented (39 / 50 methods)
 //!
 //! - 0MQ REP server (control plane).
-//! - Plan queue (FIFO).
+//! - Plan queue with history (FIFO + archived completed items).
 //! - State machine: `idle / executing_queue / paused / aborting`.
 //! - Plan / device registry — Rust-native, no Python.
 //! - Document broadcast via cirrus-callbacks `ZmqDocumentSink` (separate
 //!   PUB socket).
-//! - 10 most-used RPC methods (see `methods.rs`).
+//! - All queue ops: add / add_batch / update / get / remove /
+//!   remove_batch / move / move_batch / execute / clear /
+//!   start / stop / stop_cancel / autostart / mode_set
+//! - History: history_get / history_clear
+//! - Environment: open / close / destroy / update
+//! - RE control: pause / resume / abort / halt / stop / runs / metadata
+//! - Listings: plans_allowed / plans_existing / devices_allowed /
+//!   devices_existing
+//! - Lock manager: lock / lock_info / unlock (subsystem-aware key check)
+//! - status response includes the full bluesky shape
+//!   (`re_state`, `worker_environment_*`, `queue_*_uid`, `lock_info_uid`,
+//!   etc.)
 //!
-//! ## What's deferred
+//! ## What returns NOT_IMPLEMENTED (registered, but stub-only)
 //!
-//! - IPython kernel mode.
-//! - `script_upload` / `function_execute`.
-//! - Lock manager / permissions / user groups.
-//! - Plan history persistence.
+//! These methods are declared in the dispatch table so clients see a
+//! defined error code instead of `METHOD_NOT_FOUND`. They are
+//! bluesky-queueserver-specific and don't translate to cirrus's
+//! single-binary, no-IPython, no-permission-ACL model:
+//!
+//! - `permissions_reload`, `permissions_get`, `permissions_set`
+//! - `script_upload`, `function_execute`
+//! - `task_result`, `task_status`
+//! - `kernel_interrupt`
+//! - `manager_stop`, `manager_kill`, `manager_test`
 //!
 //! ## Example
 //!
@@ -51,6 +68,7 @@
 
 #![deny(missing_docs)]
 
+mod dispatch;
 mod methods;
 mod queue;
 mod registry;
@@ -62,4 +80,4 @@ pub use methods::{JsonRpcError, RpcRequest, RpcResponse};
 pub use queue::{PlanQueue, QueuedItem};
 pub use registry::{PlanFactory, Registry};
 pub use server::{Server, ServerBuilder, ServerShutdown};
-pub use state::{EState, EngineState};
+pub use state::{EState, EngineState, LockInfo};

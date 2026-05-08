@@ -231,3 +231,273 @@ async fn unknown_method_returns_jsonrpc_error() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_get_returns_implementation_metadata() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let r = rpc(&req, "config_get", json!({}));
+    assert_eq!(r["result"]["config"]["implementation"], "cirrus-qs");
+    assert!(r["result"]["config"]["version"].is_string());
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plans_existing_matches_plans_allowed() {
+    let port = rand_port();
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let allowed = rpc(&req, "plans_allowed", json!({}));
+    let existing = rpc(&req, "plans_existing", json!({}));
+    assert_eq!(
+        allowed["result"]["plans_allowed"],
+        existing["result"]["plans_existing"]
+    );
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_clear_empties_queue() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(s["result"]["items_in_queue"], 2);
+    rpc(&req, "queue_clear", json!({}));
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(s["result"]["items_in_queue"], 0);
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_and_get_by_uid() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let r1 = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let r2 = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 2]}}),
+    );
+    let uid_first = r1["result"]["item_uid"].as_str().unwrap().to_string();
+    let uid_second = r2["result"]["item_uid"].as_str().unwrap().to_string();
+
+    // Move the second item to the front.
+    let mv = rpc(
+        &req,
+        "queue_item_move",
+        json!({"uid": uid_second, "pos_dest": "front"}),
+    );
+    assert_eq!(mv["result"]["success"], true);
+
+    // Verify queue order via queue_get.
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["result"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["item_uid"], uid_second);
+    assert_eq!(items[1]["item_uid"], uid_first);
+
+    // queue_item_get by uid.
+    let one = rpc(&req, "queue_item_get", json!({"uid": uid_first}));
+    assert_eq!(one["result"]["item"]["item_uid"], uid_first);
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_populates_after_run() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+
+    let mut done = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let s = rpc(&req, "status", json!({}));
+        if s["result"]["plans_run"].as_u64().unwrap_or(0) >= 1 {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+
+    let h = rpc(&req, "history_get", json!({}));
+    let items = h["result"]["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "history should have at least one item");
+    assert_eq!(items[0]["name"], "count");
+
+    rpc(&req, "history_clear", json!({}));
+    let h = rpc(&req, "history_get", json!({}));
+    assert_eq!(h["result"]["items"].as_array().unwrap().len(), 0);
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_blocks_queue_ops_unless_keyed() {
+    let port = rand_port();
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(
+        &req,
+        "lock",
+        json!({"lock_key": "secret", "queue": true, "user": "alice"}),
+    );
+    assert_eq!(r["result"]["success"], true);
+
+    // Without lock_key — must be rejected.
+    let r = rpc(&req, "queue_clear", json!({}));
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("locked"));
+
+    // With wrong key — also rejected.
+    let r = rpc(&req, "queue_clear", json!({"lock_key": "wrong"}));
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("locked"));
+
+    // With correct key — allowed.
+    let r = rpc(&req, "queue_clear", json!({"lock_key": "secret"}));
+    assert_eq!(r["result"]["success"], true);
+
+    // Unlock.
+    let r = rpc(&req, "unlock", json!({"lock_key": "secret"}));
+    assert_eq!(r["result"]["success"], true);
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_metadata_round_trip() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "re_metadata",
+        json!({"metadata": {"operator": "alice", "beamline": "BL-7"}}),
+    );
+    let r = rpc(&req, "re_metadata", json!({}));
+    assert_eq!(r["result"]["metadata"]["operator"], "alice");
+    assert_eq!(r["result"]["metadata"]["beamline"], "BL-7");
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_implemented_methods_return_defined_error() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    for m in [
+        "permissions_reload",
+        "permissions_get",
+        "permissions_set",
+        "script_upload",
+        "function_execute",
+        "task_result",
+        "task_status",
+        "kernel_interrupt",
+        "manager_stop",
+        "manager_kill",
+        "manager_test",
+    ] {
+        let r = rpc(&req, m, json!({}));
+        assert_eq!(
+            r["error"]["code"], -32099,
+            "method {m} should report NOT_IMPLEMENTED"
+        );
+    }
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_includes_bluesky_fields() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let s = rpc(&req, "status", json!({}));
+    let r = &s["result"];
+    for k in [
+        "manager_state",
+        "items_in_queue",
+        "items_in_history",
+        "plans_run",
+        "plans_failed",
+        "re_state",
+        "worker_environment_exists",
+        "queue_stop_pending",
+        "queue_autostart_enabled",
+        "plan_queue_uid",
+        "plan_history_uid",
+        "lock_info_uid",
+    ] {
+        assert!(!r[k].is_null(), "status missing field: {k} (got {s})");
+    }
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

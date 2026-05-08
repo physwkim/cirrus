@@ -83,6 +83,10 @@ pub mod codes {
     /// Internal JSON-RPC error.
     #[allow(dead_code)]
     pub const INTERNAL: i64 = -32603;
+    /// Method is registered but not implemented in cirrus-qs (typically
+    /// because it's specific to bluesky-queueserver's IPython kernel,
+    /// permissions / ACL, or watchdog process model).
+    pub const NOT_IMPLEMENTED: i64 = -32099;
     /// Generic queueserver application error.
     pub const QSERVER: i64 = -32000;
 }

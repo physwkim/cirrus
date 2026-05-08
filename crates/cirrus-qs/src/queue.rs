@@ -1,4 +1,6 @@
-//! Plan queue — FIFO of [`QueuedItem`].
+//! Plan queue + plan history. Mirrors `bluesky_queueserver`'s
+//! `PlanQueueOperations`: a FIFO queue of pending items, plus a history
+//! of completed items.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +21,9 @@ pub struct QueuedItem {
     /// Free-form metadata attached by the submitter.
     #[serde(default)]
     pub meta: Value,
+    /// Result of running this item (set when moved into the history).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
 }
 
 impl QueuedItem {
@@ -30,28 +35,63 @@ impl QueuedItem {
             name: name.into(),
             args,
             meta: Value::Null,
+            result: None,
         }
+    }
+
+    /// Attach a result (used when archiving into history).
+    pub fn with_result(mut self, result: Value) -> Self {
+        self.result = Some(result);
+        self
     }
 }
 
-/// Plan queue.
+/// Queue + history. Both have stable `*_uid` strings that change every
+/// time the underlying VecDeque mutates.
 #[derive(Default, Debug)]
 pub struct PlanQueue {
     items: VecDeque<QueuedItem>,
+    history: VecDeque<QueuedItem>,
+    queue_uid: String,
+    history_uid: String,
 }
 
 impl PlanQueue {
     /// Build empty.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            items: VecDeque::new(),
+            history: VecDeque::new(),
+            queue_uid: Uuid::new_v4().to_string(),
+            history_uid: Uuid::new_v4().to_string(),
+        }
+    }
+    fn bump_queue_uid(&mut self) {
+        self.queue_uid = Uuid::new_v4().to_string();
+    }
+    fn bump_history_uid(&mut self) {
+        self.history_uid = Uuid::new_v4().to_string();
+    }
+    /// Stable UID identifying the *current* queue contents.
+    pub fn queue_uid(&self) -> &str {
+        &self.queue_uid
+    }
+    /// Stable UID identifying the *current* history contents.
+    pub fn history_uid(&self) -> &str {
+        &self.history_uid
     }
     /// Append.
     pub fn push_back(&mut self, item: QueuedItem) {
-        self.items.push_back(item)
+        self.items.push_back(item);
+        self.bump_queue_uid();
     }
     /// Pop the next item.
     pub fn pop_front(&mut self) -> Option<QueuedItem> {
-        self.items.pop_front()
+        let it = self.items.pop_front();
+        if it.is_some() {
+            self.bump_queue_uid();
+        }
+        it
     }
     /// Length.
     pub fn len(&self) -> usize {
@@ -65,13 +105,66 @@ impl PlanQueue {
     pub fn snapshot(&self) -> Vec<QueuedItem> {
         self.items.iter().cloned().collect()
     }
+    /// Look up by UID.
+    pub fn get_by_uid(&self, uid: &str) -> Option<&QueuedItem> {
+        self.items.iter().find(|i| i.item_uid == uid)
+    }
+    /// Update an item by UID. Returns the new item if found.
+    pub fn update(&mut self, uid: &str, replacement: QueuedItem) -> Option<QueuedItem> {
+        let pos = self.items.iter().position(|i| i.item_uid == uid)?;
+        let mut new_item = replacement;
+        new_item.item_uid = uid.to_string();
+        self.items[pos] = new_item.clone();
+        self.bump_queue_uid();
+        Some(new_item)
+    }
     /// Remove an item by UID. Returns the removed item if found.
     pub fn remove_by_uid(&mut self, uid: &str) -> Option<QueuedItem> {
         let pos = self.items.iter().position(|i| i.item_uid == uid)?;
-        self.items.remove(pos)
+        let r = self.items.remove(pos);
+        if r.is_some() {
+            self.bump_queue_uid();
+        }
+        r
+    }
+    /// Move an item identified by UID to position `dest` (0-based).
+    /// Returns the moved item if found.
+    pub fn move_to(&mut self, uid: &str, dest: usize) -> Option<QueuedItem> {
+        let pos = self.items.iter().position(|i| i.item_uid == uid)?;
+        let it = self.items.remove(pos)?;
+        let dest = dest.min(self.items.len());
+        self.items.insert(dest, it.clone());
+        self.bump_queue_uid();
+        Some(it)
     }
     /// Clear all pending items.
     pub fn clear(&mut self) {
-        self.items.clear();
+        if !self.items.is_empty() {
+            self.items.clear();
+            self.bump_queue_uid();
+        }
+    }
+
+    // -- history -----------------------------------------------------------
+
+    /// Snapshot the history.
+    pub fn history_snapshot(&self) -> Vec<QueuedItem> {
+        self.history.iter().cloned().collect()
+    }
+    /// History size.
+    pub fn history_size(&self) -> usize {
+        self.history.len()
+    }
+    /// Append a finished item to the history.
+    pub fn push_history(&mut self, item: QueuedItem) {
+        self.history.push_back(item);
+        self.bump_history_uid();
+    }
+    /// Clear history.
+    pub fn clear_history(&mut self) {
+        if !self.history.is_empty() {
+            self.history.clear();
+            self.bump_history_uid();
+        }
     }
 }

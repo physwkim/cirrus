@@ -26,18 +26,36 @@ enum Cmd {
     Ping,
     /// Server status: state, queue length, plans run / failed.
     Status,
+    /// `config_get` — implementation + version metadata.
+    Config,
     /// Open or close the engine environment.
     #[command(subcommand)]
     Environment(EnvCmd),
-    /// Queue operations (add / get / remove / start).
+    /// Queue operations (add / get / remove / start / stop / mode).
     #[command(subcommand)]
     Queue(QueueCmd),
-    /// RunEngine control (pause / resume / abort / halt).
+    /// RunEngine control (pause / resume / abort / halt / stop /
+    /// metadata / runs).
     #[command(subcommand)]
     Re(ReCmd),
-    /// List allowed plans / devices.
+    /// List allowed / existing plans / devices.
     #[command(subcommand)]
     Allowed(AllowedCmd),
+    /// Plan history (`history_get` / `history_clear`).
+    #[command(subcommand)]
+    History(HistoryCmd),
+    /// Lock manager (`lock` / `lock_info` / `unlock`).
+    #[command(subcommand)]
+    Lock(LockCmd),
+    /// Send a raw JSON-RPC method by name. Fallback for any method not
+    /// exposed by a dedicated subcommand.
+    Raw {
+        /// Method name to call.
+        method: String,
+        /// Optional JSON params object (default `{}`).
+        #[arg(default_value = "{}")]
+        params: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -46,6 +64,11 @@ enum EnvCmd {
     Open,
     /// `environment_close` — drop the engine.
     Close,
+    /// `environment_destroy` — force-drop without checks (cirrus aliases
+    /// to `environment_close`).
+    Destroy,
+    /// `environment_update` — refresh registry (no-op in cirrus).
+    Update,
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,8 +90,45 @@ enum QueueCmd {
         /// `item_uid` to remove.
         uid: String,
     },
+    /// `queue_clear` — drop all queued items.
+    Clear,
+    /// `queue_item_get` — fetch one queued item by uid.
+    Item {
+        /// `item_uid` to fetch.
+        uid: String,
+    },
+    /// `queue_item_move` — reorder by uid.
+    Move {
+        /// `item_uid` to move.
+        uid: String,
+        /// Destination position (`front`, `back`, or 0-based index).
+        pos_dest: String,
+    },
+    /// `queue_item_execute` — run a one-off plan without queueing.
+    Execute {
+        /// Plan name.
+        plan: String,
+        /// Positional args.
+        #[arg(num_args = 0..)]
+        args: Vec<String>,
+    },
     /// `queue_start` — begin executing the queue.
     Start,
+    /// `queue_stop` — halt the queue worker after the current item.
+    Stop,
+    /// `queue_stop_cancel` — cancel a pending stop.
+    StopCancel,
+    /// `queue_autostart` — toggle the autostart flag.
+    Autostart {
+        /// `enable` or `disable`.
+        option: String,
+    },
+    /// `queue_mode_set` — set queue mode flags. The arg is a JSON object,
+    /// e.g. `'{"loop": true}'`.
+    Mode {
+        /// JSON object describing the mode.
+        mode: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,14 +145,67 @@ enum ReCmd {
     Abort,
     /// `re_halt`.
     Halt,
+    /// `re_stop` — graceful stop, closes run with `success` status.
+    Stop,
+    /// `re_runs` — list recent run UIDs.
+    Runs,
+    /// `re_metadata` — get / set `RE.md`.
+    Metadata {
+        /// Optional JSON object to merge into `RE.md`. If absent, returns
+        /// the current metadata.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum AllowedCmd {
     /// `plans_allowed`.
     Plans,
+    /// `plans_existing` — superset of plans_allowed (cirrus has no
+    /// permissions filter, so they match).
+    PlansExisting,
     /// `devices_allowed`.
     Devices,
+    /// `devices_existing`.
+    DevicesExisting,
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryCmd {
+    /// `history_get`.
+    Get,
+    /// `history_clear`.
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum LockCmd {
+    /// `lock` — install a lock with the given key. At least one of
+    /// `--queue` or `--environment` must be set.
+    Apply {
+        /// Lock key string. Required to unlock.
+        key: String,
+        /// Lock the queue subsystem.
+        #[arg(long)]
+        queue: bool,
+        /// Lock the environment subsystem.
+        #[arg(long)]
+        environment: bool,
+        /// Free-form note.
+        #[arg(long)]
+        note: Option<String>,
+        /// User name.
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// `lock_info` — current lock state.
+    Info,
+    /// `unlock` — release the lock (key must match).
+    Release {
+        /// Lock key to verify.
+        key: String,
+    },
 }
 
 /// Entry point — returns process exit code.
@@ -117,13 +230,16 @@ pub async fn run(args: ClientArgs) -> i32 {
 }
 
 fn dispatch(args: ClientArgs) -> Result<Value, String> {
-    let (method, params) = match args.cmd {
-        Cmd::Ping => ("ping", json!({})),
-        Cmd::Status => ("status", json!({})),
-        Cmd::Environment(EnvCmd::Open) => ("environment_open", json!({})),
-        Cmd::Environment(EnvCmd::Close) => ("environment_close", json!({})),
+    let (method, params): (String, Value) = match args.cmd {
+        Cmd::Ping => ("ping".into(), json!({})),
+        Cmd::Status => ("status".into(), json!({})),
+        Cmd::Config => ("config_get".into(), json!({})),
+        Cmd::Environment(EnvCmd::Open) => ("environment_open".into(), json!({})),
+        Cmd::Environment(EnvCmd::Close) => ("environment_close".into(), json!({})),
+        Cmd::Environment(EnvCmd::Destroy) => ("environment_destroy".into(), json!({})),
+        Cmd::Environment(EnvCmd::Update) => ("environment_update".into(), json!({})),
         Cmd::Queue(QueueCmd::Add { plan, args }) => (
-            "queue_item_add",
+            "queue_item_add".into(),
             json!({
                 "item": {
                     "name": plan,
@@ -131,22 +247,96 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
                 }
             }),
         ),
-        Cmd::Queue(QueueCmd::Get) => ("queue_get", json!({})),
-        Cmd::Queue(QueueCmd::Remove { uid }) => ("queue_item_remove", json!({"uid": uid})),
-        Cmd::Queue(QueueCmd::Start) => ("queue_start", json!({})),
+        Cmd::Queue(QueueCmd::Get) => ("queue_get".into(), json!({})),
+        Cmd::Queue(QueueCmd::Remove { uid }) => {
+            ("queue_item_remove".into(), json!({"uid": uid}))
+        }
+        Cmd::Queue(QueueCmd::Clear) => ("queue_clear".into(), json!({})),
+        Cmd::Queue(QueueCmd::Item { uid }) => {
+            ("queue_item_get".into(), json!({"uid": uid}))
+        }
+        Cmd::Queue(QueueCmd::Move { uid, pos_dest }) => {
+            let pd = if let Ok(n) = pos_dest.parse::<u64>() {
+                Value::from(n)
+            } else {
+                Value::String(pos_dest)
+            };
+            (
+                "queue_item_move".into(),
+                json!({"uid": uid, "pos_dest": pd}),
+            )
+        }
+        Cmd::Queue(QueueCmd::Execute { plan, args }) => (
+            "queue_item_execute".into(),
+            json!({
+                "item": {
+                    "name": plan,
+                    "args": parse_positional_args(&args),
+                }
+            }),
+        ),
+        Cmd::Queue(QueueCmd::Start) => ("queue_start".into(), json!({})),
+        Cmd::Queue(QueueCmd::Stop) => ("queue_stop".into(), json!({})),
+        Cmd::Queue(QueueCmd::StopCancel) => ("queue_stop_cancel".into(), json!({})),
+        Cmd::Queue(QueueCmd::Autostart { option }) => (
+            "queue_autostart".into(),
+            json!({"enable": option == "enable"}),
+        ),
+        Cmd::Queue(QueueCmd::Mode { mode }) => {
+            let parsed: Value = serde_json::from_str(&mode)
+                .map_err(|e| format!("invalid mode JSON: {e}"))?;
+            ("queue_mode_set".into(), json!({"mode": parsed}))
+        }
         Cmd::Re(ReCmd::Pause { deferred }) => (
-            "re_pause",
+            "re_pause".into(),
             json!({"option": if deferred { "deferred" } else { "immediate" }}),
         ),
-        Cmd::Re(ReCmd::Resume) => ("re_resume", json!({})),
-        Cmd::Re(ReCmd::Abort) => ("re_abort", json!({})),
-        Cmd::Re(ReCmd::Halt) => ("re_halt", json!({})),
-        Cmd::Allowed(AllowedCmd::Plans) => ("plans_allowed", json!({})),
-        Cmd::Allowed(AllowedCmd::Devices) => ("devices_allowed", json!({})),
+        Cmd::Re(ReCmd::Resume) => ("re_resume".into(), json!({})),
+        Cmd::Re(ReCmd::Abort) => ("re_abort".into(), json!({})),
+        Cmd::Re(ReCmd::Halt) => ("re_halt".into(), json!({})),
+        Cmd::Re(ReCmd::Stop) => ("re_stop".into(), json!({})),
+        Cmd::Re(ReCmd::Runs) => ("re_runs".into(), json!({})),
+        Cmd::Re(ReCmd::Metadata { set }) => match set {
+            Some(s) => {
+                let parsed: Value = serde_json::from_str(&s)
+                    .map_err(|e| format!("invalid metadata JSON: {e}"))?;
+                ("re_metadata".into(), json!({"metadata": parsed}))
+            }
+            None => ("re_metadata".into(), json!({})),
+        },
+        Cmd::Allowed(AllowedCmd::Plans) => ("plans_allowed".into(), json!({})),
+        Cmd::Allowed(AllowedCmd::PlansExisting) => ("plans_existing".into(), json!({})),
+        Cmd::Allowed(AllowedCmd::Devices) => ("devices_allowed".into(), json!({})),
+        Cmd::Allowed(AllowedCmd::DevicesExisting) => ("devices_existing".into(), json!({})),
+        Cmd::History(HistoryCmd::Get) => ("history_get".into(), json!({})),
+        Cmd::History(HistoryCmd::Clear) => ("history_clear".into(), json!({})),
+        Cmd::Lock(LockCmd::Apply {
+            key,
+            queue,
+            environment,
+            note,
+            user,
+        }) => (
+            "lock".into(),
+            json!({
+                "lock_key": key,
+                "queue": queue,
+                "environment": environment,
+                "note": note,
+                "user": user,
+            }),
+        ),
+        Cmd::Lock(LockCmd::Info) => ("lock_info".into(), json!({})),
+        Cmd::Lock(LockCmd::Release { key }) => ("unlock".into(), json!({"lock_key": key})),
+        Cmd::Raw { method, params } => {
+            let parsed: Value = serde_json::from_str(&params)
+                .map_err(|e| format!("invalid params JSON: {e}"))?;
+            (method, parsed)
+        }
     };
     let req = json!({
         "jsonrpc": "2.0",
-        "method": method,
+        "method": &method,
         "params": params,
         "id": 1,
     });

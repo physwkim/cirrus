@@ -101,13 +101,17 @@ pub type SuspendCallback = Box<dyn FnOnce() -> Plan + Send + Sync>;
 /// The RunEngine.
 pub struct RunEngine {
     sinks: Vec<Arc<dyn DocumentSink>>,
-    cancel: CancellationToken,
+    /// Per-run cancellation token. Replaced at every `run_async` entry so
+    /// a stale `abort` / `stop` from a previous run doesn't immediately
+    /// tear down the new one. Borrowed via `cancel_token()`.
+    cancel: StdMutex<CancellationToken>,
     permit: Arc<Notify>,
     is_paused: Arc<AtomicBool>,
     is_running: AtomicBool,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
     is_halting: AtomicBool,
+    is_stopping: AtomicBool,
     sigint_count: AtomicU8,
     suspender_count: AtomicU64,
     sub_counter: AtomicU64,
@@ -171,13 +175,14 @@ impl RunEngine {
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
         Self {
             sinks,
-            cancel: CancellationToken::new(),
+            cancel: StdMutex::new(CancellationToken::new()),
             permit: Arc::new(Notify::new()),
             is_paused: Arc::new(AtomicBool::new(false)),
             is_running: AtomicBool::new(false),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
             is_halting: AtomicBool::new(false),
+            is_stopping: AtomicBool::new(false),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
             sub_counter: AtomicU64::new(0),
@@ -202,17 +207,21 @@ impl RunEngine {
             h();
         }
         self.is_running.store(true, Ordering::SeqCst);
-        // Reset abort/halt flags from a previous (terminated) run so
+        // Reset abort/halt/stop flags from a previous (terminated) run so
         // `RunEngine` is reusable across plans.
         self.is_aborting.store(false, Ordering::SeqCst);
         self.is_halting.store(false, Ordering::SeqCst);
+        self.is_stopping.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
+        // Renew the cancel token so a previous abort/stop's cancel state
+        // doesn't immediately tear down this run.
+        *self.cancel.lock().unwrap() = CancellationToken::new();
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
             Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
                 Ok(r) => r,
                 Err(_) => {
-                    self.cancel.cancel();
+                    self.cancel.lock().unwrap().cancel();
                     Err(CirrusError::Timeout(d))
                 }
             },
@@ -362,7 +371,7 @@ impl RunEngine {
     pub fn abort(&self, _reason: impl Into<String>) {
         self.is_aborting.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
-        self.cancel.cancel();
+        self.cancel.lock().unwrap().cancel();
         self.permit.notify_waiters();
     }
 
@@ -371,7 +380,17 @@ impl RunEngine {
         self.is_halting.store(true, Ordering::SeqCst);
         self.is_aborting.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
-        self.cancel.cancel();
+        self.cancel.lock().unwrap().cancel();
+        self.permit.notify_waiters();
+    }
+
+    /// External: graceful stop — like abort, but the run closes with
+    /// `exit_status="success"`. Mirrors bluesky's `RE.stop`.
+    pub fn stop(&self) {
+        self.is_stopping.store(true, Ordering::SeqCst);
+        self.is_aborting.store(true, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.cancel.lock().unwrap().cancel();
         self.permit.notify_waiters();
     }
 
@@ -429,20 +448,30 @@ impl RunEngine {
         let mut run_uid: Option<String> = None;
         let mut exit_status = String::from("no-run");
 
+        let resolve_exit = |this: &Self, current: &mut String| {
+            if this.is_halting.load(Ordering::SeqCst) {
+                *current = "halt".into();
+            } else if this.is_stopping.load(Ordering::SeqCst) {
+                *current = "success".into();
+            } else if this.is_aborting.load(Ordering::SeqCst) {
+                *current = "abort".into();
+            }
+        };
+
         loop {
             let msg = match self.next_msg(&plan).await {
                 Some(m) => m,
                 None => {
-                    if self.is_halting.load(Ordering::SeqCst) {
-                        exit_status = "halt".into();
-                    } else if self.is_aborting.load(Ordering::SeqCst) {
-                        exit_status = "abort".into();
-                    }
+                    resolve_exit(self, &mut exit_status);
                     break;
                 }
             };
             if self.is_halting.load(Ordering::SeqCst) {
                 exit_status = "halt".into();
+                break;
+            }
+            if self.is_stopping.load(Ordering::SeqCst) {
+                exit_status = "success".into();
                 break;
             }
             if self.is_aborting.load(Ordering::SeqCst) {
@@ -465,7 +494,8 @@ impl RunEngine {
             }
         }
 
-        // On abort/halt: close the open run with the right status.
+        // Close the open run with the right status. `stop` and the natural-end
+        // case both close as "success".
         if exit_status == "abort" || exit_status == "halt" {
             let reason = if exit_status == "halt" {
                 None
@@ -473,6 +503,14 @@ impl RunEngine {
                 Some("user-requested abort".into())
             };
             self.close_run_if_open(&exit_status, reason).await?;
+            return Ok(RunResult {
+                run_uid,
+                exit_status,
+            });
+        }
+        if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
+            self.close_run_if_open("success", Some("user-requested stop".into()))
+                .await?;
             return Ok(RunResult {
                 run_uid,
                 exit_status,
@@ -702,9 +740,10 @@ impl RunEngine {
                 self.wait_group(&group, error_on_timeout, timeout).await?;
             }
             Msg::Sleep(d) => {
+                let token = self.cancel.lock().unwrap().clone();
                 tokio::select! {
                     _ = tokio::time::sleep(d) => {}
-                    _ = self.cancel.cancelled() => {
+                    _ = token.cancelled() => {
                         return Err(CirrusError::Cancelled);
                     }
                 }
