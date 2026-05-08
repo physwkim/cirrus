@@ -9,6 +9,7 @@ use cirrus_core::msg::RunMetadata;
 use cirrus_engine::{DocumentSink, RunEngine};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 
 use crate::methods::{codes, RpcRequest, RpcResponse};
 use crate::queue::{PlanQueue, QueuedItem};
@@ -70,6 +71,7 @@ impl ServerBuilder {
             queue: Arc::new(StdMutex::new(PlanQueue::new())),
             state: Arc::new(StdMutex::new(EngineState::initial())),
             engine: Arc::new(Mutex::new(None)),
+            queue_task: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -82,6 +84,10 @@ pub struct Server {
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
+    /// AbortHandle for the currently-running `execute_queue_loop`, if any.
+    /// Stored so [`ServerShutdown::shutdown`] can stop the worker mid-plan
+    /// (rule **K1**: spawned task must terminate when its owner drops).
+    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
 }
 
 impl Server {
@@ -100,10 +106,20 @@ impl Server {
         let state = self.state.clone();
         let engine = self.engine.clone();
         let document_sink = self.document_sink.clone();
+        let queue_task = self.queue_task.clone();
 
         let join = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
-            rep_loop(rt, socket, registry, queue, state, engine, document_sink)
+            rep_loop(
+                rt,
+                socket,
+                registry,
+                queue,
+                state,
+                engine,
+                document_sink,
+                queue_task,
+            )
         });
         join.await
             .map_err(|e| CirrusError::Backend(format!("rep loop join: {e}")))?
@@ -127,10 +143,12 @@ impl Server {
     }
 
     /// Get a `ServerShutdown` handle. Calling it signals the REP loop to
-    /// exit at its next iteration (within ~200 ms).
+    /// exit at its next iteration (within ~200 ms) and aborts any
+    /// in-flight queue execution task.
     pub fn shutdown_handle(&self) -> ServerShutdown {
         ServerShutdown {
             socket: self.socket.clone(),
+            queue_task: self.queue_task.clone(),
         }
     }
 }
@@ -139,15 +157,21 @@ impl Server {
 #[derive(Clone)]
 pub struct ServerShutdown {
     socket: ReqRepSocket,
+    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
 }
 
 impl ServerShutdown {
-    /// Signal the server to exit.
+    /// Signal the server to exit. The REP loop ends within ~200 ms, and
+    /// any in-flight queue execution task is aborted (rule **K1**).
     pub fn shutdown(&self) {
         self.socket.shutdown();
+        if let Some(h) = self.queue_task.lock().unwrap().take() {
+            h.abort();
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rep_loop(
     rt: tokio::runtime::Handle,
     socket: ReqRepSocket,
@@ -156,6 +180,7 @@ fn rep_loop(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
+    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
 ) -> Result<()> {
     while !socket.is_shutdown() {
         let req = match socket.try_recv() {
@@ -171,14 +196,20 @@ fn rep_loop(
             state.clone(),
             engine.clone(),
             document_sink.clone(),
+            queue_task.clone(),
         );
         if let Err(e) = socket.send(&resp) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");
         }
     }
+    // Loop exited (shutdown). Make absolutely sure the queue worker is gone.
+    if let Some(h) = queue_task.lock().unwrap().take() {
+        h.abort();
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     rt: &tokio::runtime::Handle,
     req: &RpcRequest,
@@ -187,6 +218,7 @@ fn dispatch(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
+    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
 ) -> RpcResponse {
     let id = req.id.clone();
     match req.method.as_str() {
@@ -293,7 +325,15 @@ fn dispatch(
             let registry = registry.clone();
             let queue = queue.clone();
             let state = state.clone();
-            tokio::spawn(execute_queue_loop(re, registry, queue, state));
+            let task_slot = queue_task.clone();
+            let join = tokio::spawn(execute_queue_loop(
+                re,
+                registry,
+                queue,
+                state,
+                task_slot.clone(),
+            ));
+            *task_slot.lock().unwrap() = Some(join.abort_handle());
             RpcResponse::ok(id, json!({"success": true, "msg": ""}))
         }
 
@@ -374,7 +414,11 @@ async fn execute_queue_loop(
     registry: Arc<Registry>,
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
+    task_slot: Arc<StdMutex<Option<AbortHandle>>>,
 ) {
+    // Always clear the slot when we exit, so the slot reflects "no live
+    // worker" and a future shutdown does not abort an unrelated handle.
+    let _slot_guard = ClearOnDrop(task_slot.clone());
     loop {
         let item = queue.lock().unwrap().pop_front();
         let item = match item {
@@ -432,5 +476,15 @@ async fn execute_queue_loop(
                 return;
             }
         }
+    }
+}
+
+/// RAII guard: clears the queue-task slot on drop so a future
+/// `ServerShutdown::shutdown` doesn't abort an already-finished handle.
+struct ClearOnDrop(Arc<StdMutex<Option<AbortHandle>>>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
     }
 }

@@ -166,6 +166,56 @@ async fn unknown_plan_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_aborts_running_queue_task() {
+    use cirrus_core::msg::Msg;
+    use cirrus_core::plan::plan_box;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let port = rand_port();
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_for_factory = counter.clone();
+    let mut reg = Registry::new();
+    let factory: cirrus_qs::PlanFactory = Arc::new(move |_reg, _args| {
+        let c = counter_for_factory.clone();
+        Ok(plan_box(async_stream::stream! {
+            loop {
+                yield Msg::Sleep(Duration::from_millis(50));
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+    });
+    reg.register_plan("long_loop", factory);
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let req = req_socket(port);
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "long_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Confirm the worker is alive and ticking.
+    let mid = counter.load(Ordering::SeqCst);
+    assert!(mid > 0, "queue worker did not advance pre-shutdown");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = counter.load(Ordering::SeqCst);
+
+    // Wait again. If shutdown's abort fired, the counter must NOT advance.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let later = counter.load(Ordering::SeqCst);
+    assert_eq!(
+        after, later,
+        "queue worker continued ticking after shutdown — abort did not propagate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_method_returns_jsonrpc_error() {
     let port = rand_port();
     let mut reg = Registry::new();
