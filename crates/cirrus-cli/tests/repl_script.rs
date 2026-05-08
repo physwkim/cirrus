@@ -463,6 +463,81 @@ print("OK")
 }
 
 #[test]
+fn device_method_bluesky_style_short_names() {
+    // motor:position() / :target() / :locate() / :move_to() / :set()
+    // det:read() / :describe() / :stop() — same shape as the Rust ext
+    // traits, callable directly on a Lua device userdata.
+    let (out, err, code) = run_script(
+        r#"
+local m = soft_motor("m1", 0.5)
+local d = soft_detector("d1")
+
+assert(m:position() == 0.5)
+assert(m:target() == 0.5)
+local loc = m:locate()
+assert(loc.setpoint == 0.5 and loc.readback == 0.5)
+
+m:move_to(1.5)
+assert(m:position() == 1.5)
+
+local s = m:set(2.0)
+assert(s:done() == false)
+s:wait()
+assert(s:done() == true)
+assert(m:position() == 2.0)
+
+local r = d:read()
+assert(type(r) == "table")
+local seen_value
+for _, v in pairs(r) do seen_value = v.value; break end
+assert(type(seen_value) == "number")
+
+local desc = d:describe()
+local desc_count = 0
+for _ in pairs(desc) do desc_count = desc_count + 1 end
+assert(desc_count >= 1)
+
+m:stop()
+print("OK")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
+}
+
+#[test]
+fn device_method_role_mismatch_errors_clearly() {
+    let (_out, err, code) = run_script(
+        r#"
+local d = soft_detector("d1")
+d:set(1.0)   -- soft detector is not movable
+"#,
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("not movable"),
+        "stderr should mention 'not movable', got: {err}"
+    );
+}
+
+#[test]
+fn device_status_double_wait_errors() {
+    let (_out, err, code) = run_script(
+        r#"
+local m = soft_motor("m1", 0.0)
+local s = m:set(1.0)
+s:wait()
+s:wait()    -- second wait must error: Status is single-use
+"#,
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("already awaited"),
+        "stderr should mention 'already awaited', got: {err}"
+    );
+}
+
+#[test]
 fn coroutine_close_run_returns_exit_status() {
     let (out, err, code) = run_script(
         r#"

@@ -45,7 +45,233 @@ impl UserData for LuaDevice {
             if dev.stoppable.is_some() {
                 roles.push("stoppable");
             }
+            if dev.triggerable.is_some() {
+                roles.push("triggerable");
+            }
+            if dev.stageable.is_some() {
+                roles.push("stageable");
+            }
+            if dev.monitorable.is_some() {
+                roles.push("monitorable");
+            }
+            if dev.flyable.is_some() {
+                roles.push("flyable");
+            }
             Ok(format!("Device({}, [{}])", dev.name, roles.join(",")))
+        });
+
+        // ---- bluesky-style short-name methods (mirrors cirrus-core::ext) ----
+
+        // motor:position()  ->  number      LocatableExt::position
+        methods.add_method("position", |_, dev, ()| {
+            let lo = dev.locatable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not locatable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(lo.locate_dyn())
+                .map(|l| l.readback)
+                .map_err(|e| mlua::Error::RuntimeError(format!("position: {e}")))
+        });
+        // motor:target()    ->  number
+        methods.add_method("target", |_, dev, ()| {
+            let lo = dev.locatable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not locatable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(lo.locate_dyn())
+                .map(|l| l.setpoint)
+                .map_err(|e| mlua::Error::RuntimeError(format!("target: {e}")))
+        });
+        // motor:locate()    ->  {setpoint=, readback=}
+        methods.add_method("locate", |lua, dev, ()| {
+            let lo = dev.locatable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not locatable", dev.name))
+            })?;
+            let l = cirrus_core::runtime::cirrus_runtime()
+                .block_on(lo.locate_dyn())
+                .map_err(|e| mlua::Error::RuntimeError(format!("locate: {e}")))?;
+            let t = lua.create_table()?;
+            t.set("setpoint", l.setpoint)?;
+            t.set("readback", l.readback)?;
+            Ok(t)
+        });
+        // det:read()        ->  {field={value=, timestamp=, ...}, ...}
+        methods.add_method("read", |lua, dev, ()| {
+            let r = dev.readable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not readable", dev.name))
+            })?;
+            let data = cirrus_core::runtime::cirrus_runtime()
+                .block_on(r.read_dyn())
+                .map_err(|e| mlua::Error::RuntimeError(format!("read: {e}")))?;
+            let t = lua.create_table()?;
+            for (k, v) in data {
+                let inner = lua.create_table()?;
+                inner.set("value", json_to_lua(lua, &v.value))?;
+                inner.set("timestamp", v.timestamp)?;
+                if let Some(s) = v.alarm_severity {
+                    inner.set("alarm_severity", s as i64)?;
+                }
+                if let Some(m) = v.message {
+                    inner.set("message", m)?;
+                }
+                t.set(k, inner)?;
+            }
+            Ok(t)
+        });
+        // det:describe()    ->  {field={source=, dtype=, ...}, ...}
+        methods.add_method("describe", |lua, dev, ()| {
+            let r = dev.readable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not readable", dev.name))
+            })?;
+            let dks = cirrus_core::runtime::cirrus_runtime()
+                .block_on(r.describe_dyn())
+                .map_err(|e| mlua::Error::RuntimeError(format!("describe: {e}")))?;
+            let t = lua.create_table()?;
+            for (k, dk) in dks {
+                let inner = lua.create_table()?;
+                inner.set("source", dk.source)?;
+                inner.set("dtype", format!("{:?}", dk.dtype))?;
+                inner.set(
+                    "shape",
+                    dk.shape
+                        .iter()
+                        .filter_map(|s| s.map(|n| n as i64))
+                        .collect::<Vec<i64>>(),
+                )?;
+                if let Some(u) = dk.units {
+                    inner.set("units", u)?;
+                }
+                if let Some(p) = dk.precision {
+                    inner.set("precision", p)?;
+                }
+                t.set(k, inner)?;
+            }
+            Ok(t)
+        });
+        // motor:set(v)      ->  Status userdata (call :wait() for completion)
+        methods.add_method("set", |_, dev, v: f64| {
+            let mv = dev.movable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not movable", dev.name))
+            })?;
+            let status = cirrus_core::runtime::cirrus_runtime().block_on(mv.set_dyn(v));
+            Ok(LuaStatus {
+                inner: TMutex::new(Some(status)),
+                label: format!("set({}={v})", dev.name),
+            })
+        });
+        // motor:move_to(v)  ->  nil  (set + wait for completion)
+        methods.add_method("move_to", |_, dev, v: f64| {
+            let mv = dev.movable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not movable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(async move {
+                    let s = mv.set_dyn(v).await;
+                    s.await
+                })
+                .map_err(|e| mlua::Error::RuntimeError(format!("move_to: {e:?}")))?;
+            Ok(())
+        });
+        // det:trigger()     ->  Status userdata
+        methods.add_method("trigger", |_, dev, ()| {
+            let t = dev.triggerable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not triggerable", dev.name))
+            })?;
+            let status = cirrus_core::runtime::cirrus_runtime().block_on(t.trigger_dyn());
+            Ok(LuaStatus {
+                inner: TMutex::new(Some(status)),
+                label: format!("trigger({})", dev.name),
+            })
+        });
+        // motor:stop()      ->  nil
+        methods.add_method("stop", |_, dev, ()| {
+            let s = dev.stoppable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not stoppable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(s.stop_dyn(true))
+                .map_err(|e| mlua::Error::RuntimeError(format!("stop: {e}")))?;
+            Ok(())
+        });
+        // motor:stop_emergency() -> nil
+        methods.add_method("stop_emergency", |_, dev, ()| {
+            let s = dev.stoppable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not stoppable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(s.stop_dyn(false))
+                .map_err(|e| mlua::Error::RuntimeError(format!("stop_emergency: {e}")))?;
+            Ok(())
+        });
+        // dev:stage() / dev:unstage() -> nil
+        methods.add_method("stage", |_, dev, ()| {
+            let s = dev.stageable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not stageable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(s.stage_dyn())
+                .map_err(|e| mlua::Error::RuntimeError(format!("stage: {e}")))?;
+            Ok(())
+        });
+        methods.add_method("unstage", |_, dev, ()| {
+            let s = dev.stageable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not stageable", dev.name))
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(s.unstage_dyn())
+                .map_err(|e| mlua::Error::RuntimeError(format!("unstage: {e}")))?;
+            Ok(())
+        });
+        // flyer:kickoff() / :complete() -> Status
+        methods.add_method("kickoff", |_, dev, ()| {
+            let f = dev.flyable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not flyable", dev.name))
+            })?;
+            let status = cirrus_core::runtime::cirrus_runtime().block_on(f.kickoff_dyn());
+            Ok(LuaStatus {
+                inner: TMutex::new(Some(status)),
+                label: format!("kickoff({})", dev.name),
+            })
+        });
+        methods.add_method("complete", |_, dev, ()| {
+            let f = dev.flyable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not flyable", dev.name))
+            })?;
+            let status = cirrus_core::runtime::cirrus_runtime().block_on(f.complete_dyn());
+            Ok(LuaStatus {
+                inner: TMutex::new(Some(status)),
+                label: format!("complete({})", dev.name),
+            })
+        });
+    }
+}
+
+/// Lua-side `Status` handle. Wraps a single-use `cirrus_core::Status` so
+/// users can `s:wait()` to block on completion. Returned by
+/// `motor:set(v)`, `det:trigger()`, `flyer:kickoff()`, `flyer:complete()`.
+pub struct LuaStatus {
+    inner: TMutex<Option<cirrus_core::status::Status>>,
+    label: String,
+}
+
+impl UserData for LuaStatus {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method("__tostring", |_, s, ()| Ok(format!("Status({})", s.label)));
+        // s:wait() — block until the operation completes. Returns nil on
+        // success; raises a Lua error on failure.
+        methods.add_method("wait", |_, s, ()| {
+            let st = s.inner.blocking_lock().take().ok_or_else(|| {
+                mlua::Error::RuntimeError("Status already awaited".into())
+            })?;
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(st)
+                .map_err(|e| mlua::Error::RuntimeError(format!("status: {e:?}")))?;
+            Ok(())
+        });
+        // s:done() — non-blocking: true if no longer pending. Currently
+        // Status is single-use; once `wait` consumes it, done()=true.
+        methods.add_method("done", |_, s, ()| {
+            Ok(s.inner.blocking_lock().is_none())
         });
     }
 }

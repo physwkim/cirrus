@@ -203,6 +203,21 @@ Lua globals registered:
                        RE:md_set(key, value)
   soft_detector(name)
   soft_motor(name, init?)
+
+Bluesky-style device methods (mirrors cirrus-core::ext):
+  motor:position()              -> number     (locatable readback)
+  motor:target()                -> number     (locatable setpoint)
+  motor:locate()                -> {{setpoint=, readback=}}
+  det:read()                    -> {{field={{value=, timestamp=, ...}}}}
+  det:describe()                -> {{field={{source=, dtype=, ...}}}}
+  motor:set(v)                  -> Status     (call s:wait() to block)
+  motor:move_to(v)              -> nil        (set + wait combined)
+  det:trigger()                 -> Status
+  motor:stop() / :stop_emergency() -> nil
+  dev:stage() / :unstage()      -> nil
+  flyer:kickoff() / :complete() -> Status
+  Status:wait()                 -> nil (raises on failure)
+  Status:done()                 -> bool
   count({{detectors}}, n)        plan
   scan({{detectors}}, motor, start, stop, n)
   mvr(motor, delta)
