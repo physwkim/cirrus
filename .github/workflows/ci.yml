@@ -47,3 +47,36 @@ jobs:
       - run: cargo run --example async_count --quiet
       - run: cargo run --example sync_count --quiet
       - run: cargo run --example scan_motor --quiet
+
+  # Verify each opt-in feature compiles and its tests pass. Default
+  # CI runs without these features so the matrix above stays fast;
+  # this job catches feature-gated regressions.
+  features:
+    name: opt-in features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ZMQ document sink — needs libzmq.
+      - name: install libzmq
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev pkg-config
+      - name: build/test cirrus-callbacks --features zmq
+        run: cargo test -p cirrus-callbacks --features zmq --no-fail-fast
+      # Tiled document sink — pulls in tiled-client (HTTP).
+      - name: build/test cirrus-callbacks --features tiled
+        run: cargo test -p cirrus-callbacks --features tiled --no-fail-fast
+      # HDF5 detector frame sink — pure-Rust rust-hdf5, no system libhdf5.
+      - name: build/test cirrus-stream --features hdf5
+        run: cargo test -p cirrus-stream --features hdf5 --no-fail-fast
+      # PVA monitor source — pulls in epics-pva-rs.
+      - name: build cirrus-stream --features pva
+        run: cargo build -p cirrus-stream --features pva
+      # Real EPICS CA backend — pulls in epics-ca-rs + epics-base-rs.
+      # Build-only for now (live IOC integration deferred to a
+      # dedicated job that needs a softIoc subprocess).
+      - name: build cirrus-backend-epics-ca --features real
+        run: cargo build -p cirrus-backend-epics-ca --features real
+      # Real EPICS PVA backend.
+      - name: build cirrus-backend-epics-pva --features real
+        run: cargo build -p cirrus-backend-epics-pva --features real
