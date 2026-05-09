@@ -26,3 +26,12 @@ async-stream.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 cirrus-engine.workspace = true
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "plan_loop"
+harness = false
+
+[[bench]]
+name = "document_fanout"
+harness = false
