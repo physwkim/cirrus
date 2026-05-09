@@ -557,6 +557,47 @@ async fn status_includes_manager_version() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_inspect_returns_state_json() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "device_inspect", json!({"name": "det1"}));
+    assert!(
+        r["result"]["success"].as_bool().unwrap_or(false),
+        "device_inspect should succeed: {r}"
+    );
+    assert_eq!(r["result"]["name"], "det1");
+    assert_eq!(r["result"]["state"]["type"], "SoftDetector");
+    assert_eq!(r["result"]["state"]["name"], "det1");
+    assert!(r["result"]["state"]["counts"].is_number());
+
+    // Unknown device.
+    let r = rpc(&req, "device_inspect", json!({"name": "nope"}));
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no device"),
+        "expected 'no device' message, got {r}"
+    );
+
+    // Missing name param.
+    let r = rpc(&req, "device_inspect", json!({}));
+    assert_eq!(
+        r["error"]["code"], -32602,
+        "missing name → INVALID_PARAMS: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rbac_denies_mutation_for_read_only_group() {
     // Permissions config: anonymous callers (no api_key) land in
     // `viewer`, which is read-only. `admin-key` → admin group with full

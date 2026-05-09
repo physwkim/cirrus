@@ -89,6 +89,32 @@ impl Registry {
         v
     }
 
+    /// Look up `name` across every role table and return the first
+    /// `NamedObj::inspect_dyn` result. The map is sorted-iterated in
+    /// the same role order as registration so the result is stable.
+    /// `None` if the name is not registered in any role.
+    pub fn inspect_device(&self, name: &str) -> Option<serde_json::Value> {
+        if let Some(o) = self.readables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.movables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.triggerables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.stageables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.flyables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.collectables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        None
+    }
+
     /// All device names (union over all role registrations).
     pub fn device_names(&self) -> Vec<String> {
         let mut s = std::collections::BTreeSet::new();

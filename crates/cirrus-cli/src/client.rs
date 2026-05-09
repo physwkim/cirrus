@@ -47,6 +47,13 @@ enum Cmd {
     /// Lock manager (`lock` / `lock_info` / `unlock`).
     #[command(subcommand)]
     Lock(LockCmd),
+    /// Inspect a registered device — dumps the device's current state
+    /// as JSON (setpoint / readback / connected / kind / etc.). Calls
+    /// `NamedObj::inspect_dyn` on the server side; sync, no I/O.
+    Inspect {
+        /// Device name as registered server-side.
+        name: String,
+    },
     /// Send a raw JSON-RPC method by name. Fallback for any method not
     /// exposed by a dedicated subcommand.
     Raw {
@@ -324,6 +331,7 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         ),
         Cmd::Lock(LockCmd::Info) => ("lock_info".into(), json!({})),
         Cmd::Lock(LockCmd::Release { key }) => ("unlock".into(), json!({"lock_key": key})),
+        Cmd::Inspect { name } => ("device_inspect".into(), json!({"name": name})),
         Cmd::Raw { method, params } => {
             let parsed: Value =
                 serde_json::from_str(&params).map_err(|e| format!("invalid params JSON: {e}"))?;

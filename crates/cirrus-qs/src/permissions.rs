@@ -85,8 +85,8 @@ pub fn classify(method: &str) -> MethodClass {
     match method {
         // Read-only / informational.
         "ping" | "status" | "config_get" | "queue_get" | "history_get" | "plans_allowed"
-        | "plans_existing" | "devices_allowed" | "devices_existing" | "lock_info"
-        | "task_status" | "task_result" | "permissions_get" | "manager_test"
+        | "plans_existing" | "devices_allowed" | "devices_existing" | "device_inspect"
+        | "lock_info" | "task_status" | "task_result" | "permissions_get" | "manager_test"
         | "manager_version" | "re_runs" => MethodClass::Info,
 
         // Queue add — plan-name-checked.

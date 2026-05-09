@@ -115,6 +115,29 @@ pub(crate) fn dispatch(
                 "devices_existing_uid": "static",
             }),
         ),
+        "device_inspect" => {
+            let name = match req.params.get("name").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => {
+                    return RpcResponse::err(
+                        id,
+                        codes::INVALID_PARAMS,
+                        "device_inspect: missing string param 'name'",
+                    );
+                }
+            };
+            match registry.inspect_device(name) {
+                Some(state) => RpcResponse::ok(
+                    id,
+                    json!({"success": true, "msg": "", "name": name, "state": state}),
+                ),
+                None => RpcResponse::err(
+                    id,
+                    codes::QSERVER,
+                    format!("device_inspect: no device named {name:?}"),
+                ),
+            }
+        }
 
         // -- environment --------------------------------------------------
         "environment_open" => env_open(id, document_sink, &state, &engine, rt),
