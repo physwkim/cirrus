@@ -859,6 +859,87 @@ async fn lua_eval_propagates_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_rejects_oversize_source() {
+    // R6.1: the dispatcher caps source size at 1 MiB so a runaway
+    // client can't pin daemon memory.
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let huge: String = "a".repeat((1 << 20) + 1);
+    let r = rpc(&req, "lua_eval", json!({"source": huge}));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source too large"),
+        "expected 'source too large' message: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// A LuaEvaluator that always panics. Verifies the dispatcher's
+/// catch_unwind path: a panicking eval future must still call
+/// `tracker.complete` (with an error result) so clients don't
+/// poll a "running" task forever.
+struct PanickingEval;
+
+#[async_trait::async_trait]
+impl cirrus_qs::LuaEvaluator for PanickingEval {
+    async fn eval(&self, _source: &str) -> cirrus_qs::EvalResult {
+        panic!("synthetic eval panic");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_panic_surfaces_as_failed_task() {
+    // R6.2: a panicking eval future would otherwise leave the task
+    // stuck `running` forever (tracker.complete never called).
+    // catch_unwind in the dispatcher recovers and surfaces the panic
+    // as a normal failed result.
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(PanickingEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "lua_eval", json!({"source": "anything"}));
+    let uid = r["result"]["task_uid"]
+        .as_str()
+        .expect("task_uid")
+        .to_string();
+
+    // Poll until terminal. Must reach `failed`, not stay `running`.
+    let mut got_failed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+        if s["result"]["status"] == "failed" {
+            got_failed = true;
+            let r2 = rpc(&req, "task_result", json!({"task_uid": uid}));
+            let tb = r2["result"]["result"]["traceback"].as_str().unwrap_or("");
+            assert!(
+                tb.contains("panicked") && tb.contains("synthetic"),
+                "traceback should name the panic: {r2}"
+            );
+            break;
+        }
+    }
+    assert!(
+        got_failed,
+        "panicking eval task did not surface as failed within 1.5s"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lua_eval_without_evaluator_returns_not_implemented() {
     let port = rand_port();
     let reg = Registry::new();

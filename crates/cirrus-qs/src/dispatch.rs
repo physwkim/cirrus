@@ -326,6 +326,21 @@ pub(crate) fn dispatch(
                     );
                 }
             };
+            // Sanity-bound the input. A malicious or buggy client
+            // sending tens of MB of Lua source would otherwise pin
+                // daemon memory through the parse + spawn path.
+            const MAX_LUA_EVAL_SOURCE: usize = 1 << 20; // 1 MiB
+            if src.len() > MAX_LUA_EVAL_SOURCE {
+                return RpcResponse::err(
+                    id,
+                    codes::INVALID_PARAMS,
+                    format!(
+                        "lua_eval: source too large ({} bytes, max {} bytes)",
+                        src.len(),
+                        MAX_LUA_EVAL_SOURCE
+                    ),
+                );
+            }
             let ev = match lua_evaluator.clone() {
                 Some(e) => e,
                 None => {
@@ -342,7 +357,26 @@ pub(crate) fn dispatch(
             let tracker = task_tracker.clone();
             let uid_for_task = task_uid.clone();
             rt.spawn(async move {
-                let result = ev.eval(&src).await;
+                // Catch panics from the eval future so a fault
+                // (mlua bug, OOM, etc.) doesn't leave the task
+                // stuck in `Running` forever — the tracker would
+                // never receive `complete()` and clients would
+                // poll indefinitely until eviction.
+                use futures::FutureExt;
+                let result = match std::panic::AssertUnwindSafe(ev.eval(&src))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(p) => {
+                        let msg = panic_payload_message(p);
+                        crate::tasks::EvalResult {
+                            stdout: String::new(),
+                            return_value: None,
+                            error: Some(format!("lua_eval panicked: {msg}")),
+                        }
+                    }
+                };
                 tracker.complete(&uid_for_task, result);
             });
             RpcResponse::ok(
@@ -393,6 +427,21 @@ pub(crate) fn dispatch(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+/// Best-effort extraction of a panic payload's message. The payload
+/// is an `Any` whose concrete type depends on whether the panic was
+/// raised via `panic!("...")` (`String`), `panic!("{...}", x)` (also
+/// `String`), or `panic_any(T)` (arbitrary). Returns `<no message>`
+/// if neither a `&str` nor a `String` is recoverable.
+fn panic_payload_message(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        return s.to_string();
+    }
+    if let Some(s) = p.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<no message>".to_string()
+}
 
 /// Per-task RBAC gate for `task_status` / `task_result`. If the uid
 /// is unknown, allow (legacy bluesky-queueserver clients synthesize
