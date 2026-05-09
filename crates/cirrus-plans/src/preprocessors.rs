@@ -408,6 +408,106 @@ pub fn configure_count_time_wrapper(
     })
 }
 
+/// `lazily_stage_wrapper(plan, devices)` — stage each device on its
+/// **first** `Read` / `Set` / `Trigger` / `Configure` reference instead
+/// of upfront. Devices that the inner plan never touches are not staged
+/// (and not unstaged). At the end of the inner plan, unstage everything
+/// that was lazily staged, in LIFO order.
+///
+/// Mirrors `bluesky.preprocessors.lazily_stage_wrapper`. Useful for
+/// generic plans where the device list is large but the actual touch
+/// set per run is sparse.
+pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
+    use std::collections::HashSet;
+    plan_box(async_stream::stream! {
+        let by_name: HashMap<String, Arc<dyn StageableObj>> =
+            devices.into_iter().map(|d| (d.name().to_string(), d)).collect();
+        let mut staged: Vec<Arc<dyn StageableObj>> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            if let PlanItem::Bare(m) = item {
+                let touched: Option<&str> = match &m {
+                    Msg::Read(o)            => Some(o.name()),
+                    Msg::Set { obj, .. }    => Some(obj.name()),
+                    Msg::Trigger { obj, .. } => Some(obj.name()),
+                    Msg::Configure { obj, .. } => Some(obj.name()),
+                    _ => None,
+                };
+                if let Some(name) = touched {
+                    if seen.insert(name.to_string()) {
+                        if let Some(d) = by_name.get(name) {
+                            yield Msg::Stage(d.clone());
+                            staged.push(d.clone());
+                        }
+                    }
+                }
+                yield m;
+            }
+        }
+        for d in staged.into_iter().rev() {
+            yield Msg::Unstage(d);
+        }
+    })
+}
+
+/// `set_run_key_wrapper(plan, run_key)` — for every `OpenRun` the inner
+/// plan emits, inject `run_key` into `metadata.extra["run_key"]`. Useful
+/// for multi-run plans (e.g. `pchain` of two scans) where downstream
+/// consumers want to disambiguate the runs after the fact.
+///
+/// Mirrors `bluesky.preprocessors.set_run_key_wrapper`. If the inner
+/// plan already set `run_key`, the existing value is preserved
+/// (consistent with `inject_md_wrapper`'s `entry().or_insert()` shape).
+pub fn set_run_key_wrapper(inner: Plan, run_key: impl Into<String>) -> Plan {
+    let key = run_key.into();
+    msg_mutator(inner, move |m| match m {
+        Msg::OpenRun(mut meta) => {
+            meta.extra
+                .entry("run_key".to_string())
+                .or_insert_with(|| Value::from(key.clone()));
+            Msg::OpenRun(meta)
+        }
+        other => other,
+    })
+}
+
+/// `stub_wrapper(plan)` — assert that the inner plan does **not** open
+/// any runs. If an `OpenRun` (or `CloseRun`) slips through, abort the
+/// plan with `Msg::Fail` carrying a diagnostic. Useful for composing
+/// "stub" plans that should be embeddable inside an outer
+/// `run_wrapper` without nesting runs.
+///
+/// Mirrors `bluesky.preprocessors.stub_wrapper`. Bluesky raises an
+/// `IllegalMessageSequence` exception; cirrus surfaces the same
+/// constraint via the engine's `Msg::Fail` handler, which aborts the
+/// run with the supplied reason.
+pub fn stub_wrapper(inner: Plan) -> Plan {
+    plan_box(async_stream::stream! {
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            if let PlanItem::Bare(m) = item {
+                match &m {
+                    Msg::OpenRun(_) => {
+                        yield Msg::Fail(
+                            "stub_wrapper: inner plan must not emit OpenRun".into(),
+                        );
+                        return;
+                    }
+                    Msg::CloseRun { .. } => {
+                        yield Msg::Fail(
+                            "stub_wrapper: inner plan must not emit CloseRun".into(),
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+                yield m;
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +544,124 @@ mod tests {
         let p2 = plan_box(async_stream::stream! { yield Msg::Null; yield Msg::Null; });
         let chained = pchain(vec![p1, p2]);
         assert_eq!(drain(chained).await.len(), 3);
+    }
+
+    use cirrus_core::error::CirrusError;
+
+    struct FakeStage(String);
+    impl cirrus_core::msg::NamedObj for FakeStage {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::StageableObj for FakeStage {
+        async fn stage_dyn(&self) -> Result<(), CirrusError> {
+            Ok(())
+        }
+        async fn unstage_dyn(&self) -> Result<(), CirrusError> {
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::ReadableObj for FakeStage {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, cirrus_core::reading::ReadingValue>, CirrusError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, cirrus_event_model::DataKey>, CirrusError> {
+            Ok(HashMap::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn lazily_stage_wrapper_stages_only_touched_devices() {
+        let a: Arc<FakeStage> = Arc::new(FakeStage("a".into()));
+        let b: Arc<FakeStage> = Arc::new(FakeStage("b".into()));
+        let a_read: Arc<dyn ReadableObj> = a.clone();
+        let body = plan_box(async_stream::stream! {
+            yield Msg::Read(a_read);
+            yield Msg::Null;
+        });
+        let stageables: Vec<Arc<dyn StageableObj>> = vec![a.clone(), b.clone()];
+        let wrapped = lazily_stage_wrapper(body, stageables);
+        let msgs = drain(wrapped).await;
+        // Stage(a), Read(a), Null, Unstage(a) — b was never touched
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], Msg::Stage(d) if d.name() == "a"));
+        assert!(matches!(&msgs[1], Msg::Read(_)));
+        assert!(matches!(&msgs[2], Msg::Null));
+        assert!(matches!(&msgs[3], Msg::Unstage(d) if d.name() == "a"));
+    }
+
+    #[tokio::test]
+    async fn set_run_key_wrapper_injects_run_key() {
+        let body = plan_box(async_stream::stream! {
+            yield Msg::OpenRun(RunMetadata::default());
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        });
+        let wrapped = set_run_key_wrapper(body, "scan_42");
+        let msgs = drain(wrapped).await;
+        match &msgs[0] {
+            Msg::OpenRun(md) => {
+                assert_eq!(md.extra.get("run_key"), Some(&Value::from("scan_42")));
+            }
+            _ => panic!("expected OpenRun"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_run_key_wrapper_preserves_existing() {
+        let mut md = RunMetadata::default();
+        md.extra
+            .insert("run_key".to_string(), Value::from("preset"));
+        let body = plan_box(async_stream::stream! {
+            yield Msg::OpenRun(md);
+        });
+        let wrapped = set_run_key_wrapper(body, "should_not_overwrite");
+        let msgs = drain(wrapped).await;
+        match &msgs[0] {
+            Msg::OpenRun(md) => {
+                assert_eq!(md.extra.get("run_key"), Some(&Value::from("preset")));
+            }
+            _ => panic!("expected OpenRun"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_wrapper_passes_through_run_free_plan() {
+        let body = plan_box(async_stream::stream! {
+            yield Msg::Null;
+            yield Msg::Sleep(std::time::Duration::from_millis(0));
+        });
+        let msgs = drain(stub_wrapper(body)).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Fail(_))));
+    }
+
+    #[tokio::test]
+    async fn stub_wrapper_fails_on_open_run() {
+        let body = plan_box(async_stream::stream! {
+            yield Msg::Null;
+            yield Msg::OpenRun(RunMetadata::default());
+            yield Msg::Null; // never reached
+        });
+        let msgs = drain(stub_wrapper(body)).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], Msg::Null));
+        assert!(matches!(&msgs[1], Msg::Fail(s) if s.contains("OpenRun")));
+    }
+
+    #[tokio::test]
+    async fn stub_wrapper_fails_on_close_run() {
+        let body = plan_box(async_stream::stream! {
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        });
+        let msgs = drain(stub_wrapper(body)).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Msg::Fail(s) if s.contains("CloseRun")));
     }
 }
