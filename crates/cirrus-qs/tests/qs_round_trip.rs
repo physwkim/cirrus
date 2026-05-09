@@ -706,3 +706,169 @@ async fn rbac_filters_plan_name_on_queue_add() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+// -- lua_eval async RPC -----------------------------------------------------
+
+/// Mock LuaEvaluator: echoes the source as stdout, parses a leading
+/// integer from `source` as a sleep delay (ms) before completing. Lets
+/// the test drive a "still-running" assertion deterministically.
+struct MockEval;
+
+#[async_trait::async_trait]
+impl cirrus_qs::LuaEvaluator for MockEval {
+    async fn eval(&self, source: &str) -> cirrus_qs::EvalResult {
+        let ms: u64 = source
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        if source.contains("BOOM") {
+            return cirrus_qs::EvalResult {
+                stdout: String::new(),
+                return_value: None,
+                error: Some("synthetic".into()),
+            };
+        }
+        cirrus_qs::EvalResult {
+            stdout: format!("echo: {source}"),
+            return_value: Some("nil".into()),
+            error: None,
+        }
+    }
+}
+
+fn spawn_server_with_eval(
+    reg: Registry,
+    port: u16,
+    ev: Arc<dyn cirrus_qs::LuaEvaluator>,
+) -> ServerShutdown {
+    let ep = endpoint(port);
+    let server = Server::builder()
+        .control_address(ep)
+        .document_address(format!(
+            "ipc:///tmp/cirrus-qs-doc-{}-{}.sock",
+            std::process::id(),
+            port
+        ))
+        .registry(reg)
+        .lua_evaluator(ev)
+        .build()
+        .expect("server build");
+    let shutdown = server.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = server.run_async().await;
+    });
+    shutdown
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_async_returns_task_uid_and_completes() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "lua_eval", json!({"source": "0"}));
+    assert!(r["result"]["success"].as_bool().unwrap_or(false), "{r}");
+    let uid = r["result"]["task_uid"]
+        .as_str()
+        .expect("task_uid")
+        .to_string();
+
+    let mut completed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+        if s["result"]["status"] == "completed" {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "task_status never reached completed");
+
+    let r = rpc(&req, "task_result", json!({"task_uid": uid}));
+    assert_eq!(r["result"]["status"], "completed");
+    assert_eq!(r["result"]["result"]["success"], true);
+    assert_eq!(r["result"]["result"]["stdout"], "echo: 0");
+    assert_eq!(r["result"]["result"]["return_value"], "nil");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_running_state_visible_during_eval() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "lua_eval", json!({"source": "500"}));
+    let uid = r["result"]["task_uid"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+    assert_eq!(s["result"]["status"], "running", "{s}");
+
+    let mut completed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+        if s["result"]["status"] == "completed" {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_propagates_failure() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "lua_eval", json!({"source": "0 BOOM"}));
+    let uid = r["result"]["task_uid"].as_str().unwrap().to_string();
+    let mut done = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+        if s["result"]["status"] != "running" {
+            assert_eq!(s["result"]["status"], "failed", "expected failed: {s}");
+            let r2 = rpc(&req, "task_result", json!({"task_uid": uid}));
+            assert_eq!(r2["result"]["result"]["success"], false);
+            assert_eq!(r2["result"]["result"]["traceback"], "synthetic");
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lua_eval_without_evaluator_returns_not_implemented() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(&req, "lua_eval", json!({"source": "1+1"}));
+    assert_eq!(r["error"]["code"], -32099, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

@@ -120,7 +120,9 @@ pub fn classify(method: &str) -> MethodClass {
 
         // Admin-only.
         "permissions_reload" | "permissions_set" | "manager_stop" | "manager_kill"
-        | "script_upload" | "function_execute" | "kernel_interrupt" => MethodClass::Admin,
+        | "script_upload" | "function_execute" | "kernel_interrupt" | "lua_eval" => {
+            MethodClass::Admin
+        }
 
         // Lock subsystem — has its own auth.
         "lock" | "unlock" => MethodClass::Lock,

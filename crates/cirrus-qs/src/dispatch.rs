@@ -17,11 +17,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
+use crate::lua_eval::LuaEvaluator;
 use crate::methods::{codes, RpcRequest, RpcResponse};
 use crate::permissions::Permissions;
 use crate::queue::{PlanQueue, QueuedItem};
 use crate::registry::Registry;
 use crate::state::{EState, EngineState};
+use crate::tasks::TaskTracker;
 
 /// Top-level dispatch entry. Returns the JSON-RPC response shape.
 #[allow(clippy::too_many_arguments)]
@@ -35,6 +37,8 @@ pub(crate) fn dispatch(
     document_sink: Option<Arc<dyn DocumentSink>>,
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
     permissions: Arc<Permissions>,
+    lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
+    task_tracker: Arc<TaskTracker>,
 ) -> RpcResponse {
     let id = req.id.clone();
     let m = req.method.as_str();
@@ -243,30 +247,100 @@ pub(crate) fn dispatch(
         //    call these even when the server side does the work
         //    synchronously. Return a "completed / no-op" shape so
         //    naive clients don't error.
-        "task_status" => RpcResponse::ok(
-            id,
-            json!({
-                "success": true,
-                "msg": "",
-                "status": "completed",
-                "task_uid": req.params.get("task_uid").cloned().unwrap_or(Value::Null),
-            }),
-        ),
-        "task_result" => RpcResponse::ok(
-            id,
-            json!({
-                "success": true,
-                "msg": "",
-                "status": "completed",
-                "result": {
-                    "return_value": null,
-                    "traceback": "",
-                    "msg": "",
+        "task_status" => {
+            let uid = req
+                .params
+                .get("task_uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Tracker is authoritative for tasks we registered; fall
+            // back to "completed" for unknown uids so naive bluesky
+            // clients (that synthesize uids on the client side) still
+            // get a sensible answer.
+            let status = task_tracker.status(uid).unwrap_or("completed");
+            RpcResponse::ok(
+                id,
+                json!({
                     "success": true,
+                    "msg": "",
+                    "status": status,
                     "task_uid": req.params.get("task_uid").cloned().unwrap_or(Value::Null),
-                },
-            }),
-        ),
+                }),
+            )
+        }
+        "task_result" => {
+            let uid = req
+                .params
+                .get("task_uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let status = task_tracker.status(uid).unwrap_or("completed");
+            let (success, return_value, traceback) = match task_tracker.result(uid) {
+                Some(r) => (
+                    r.is_success(),
+                    r.return_value.map(Value::String).unwrap_or(Value::Null),
+                    r.error.unwrap_or_default(),
+                ),
+                None => (true, Value::Null, String::new()),
+            };
+            // Stdout from the eval. Captured separately so naive
+            // clients reading only `result` see something meaningful.
+            let stdout = task_tracker
+                .result(uid)
+                .map(|r| r.stdout)
+                .unwrap_or_default();
+            RpcResponse::ok(
+                id,
+                json!({
+                    "success": true,
+                    "msg": "",
+                    "status": status,
+                    "result": {
+                        "return_value": return_value,
+                        "traceback": traceback,
+                        "stdout": stdout,
+                        "msg": "",
+                        "success": success,
+                        "task_uid": uid,
+                    },
+                }),
+            )
+        }
+        "lua_eval" => {
+            let src = match req.params.get("source").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => {
+                    return RpcResponse::err(
+                        id,
+                        codes::INVALID_PARAMS,
+                        "lua_eval: missing string param 'source'",
+                    );
+                }
+            };
+            let ev = match lua_evaluator.clone() {
+                Some(e) => e,
+                None => {
+                    return RpcResponse::err(
+                        id,
+                        codes::NOT_IMPLEMENTED,
+                        "lua_eval: this cirrus-qs build has no Lua evaluator wired \
+                         (use `cirrus qs-manager` rather than a custom build)",
+                    );
+                }
+            };
+            let task_uid = uuid::Uuid::new_v4().to_string();
+            task_tracker.start(&task_uid);
+            let tracker = task_tracker.clone();
+            let uid_for_task = task_uid.clone();
+            rt.spawn(async move {
+                let result = ev.eval(&src).await;
+                tracker.complete(&uid_for_task, result);
+            });
+            RpcResponse::ok(
+                id,
+                json!({"success": true, "msg": "", "task_uid": task_uid}),
+            )
+        }
         "manager_test" => RpcResponse::ok(
             id,
             json!({"success": true, "msg": ""}),

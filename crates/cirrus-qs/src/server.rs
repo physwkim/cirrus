@@ -11,10 +11,12 @@ use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
 use crate::dispatch::dispatch;
+use crate::lua_eval::LuaEvaluator;
 use crate::permissions::Permissions;
 use crate::queue::PlanQueue;
 use crate::registry::Registry;
 use crate::state::{EState, EngineState};
+use crate::tasks::TaskTracker;
 use crate::transport::ReqRepSocket;
 
 /// Server builder. Construct and `build()` to commit (rule **K9** — no
@@ -31,6 +33,9 @@ pub struct ServerBuilder {
     /// permissive (any caller is `default_group = primary` and
     /// `primary` allows everything).
     permissions_path: Option<std::path::PathBuf>,
+    /// Optional Lua evaluator. Without this, the `lua_eval` RPC
+    /// returns `NOT_IMPLEMENTED`.
+    lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
 }
 
 impl Default for ServerBuilder {
@@ -41,6 +46,7 @@ impl Default for ServerBuilder {
             registry: None,
             metrics_address: None,
             permissions_path: None,
+            lua_evaluator: None,
         }
     }
 }
@@ -75,6 +81,14 @@ impl ServerBuilder {
     /// `default_group = primary`.
     pub fn permissions_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.permissions_path = Some(path.into());
+        self
+    }
+    /// Provide a [`LuaEvaluator`] for the `lua_eval` RPC. Without
+    /// this, `lua_eval` returns `NOT_IMPLEMENTED`. The evaluator
+    /// shares state across calls (typical impls hold one mlua state
+    /// behind a mutex; see the cirrus-cli `manager` module).
+    pub fn lua_evaluator(mut self, ev: Arc<dyn LuaEvaluator>) -> Self {
+        self.lua_evaluator = Some(ev);
         self
     }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
@@ -127,6 +141,8 @@ impl ServerBuilder {
             engine: Arc::new(Mutex::new(None)),
             queue_task: Arc::new(StdMutex::new(None)),
             permissions,
+            lua_evaluator: self.lua_evaluator,
+            task_tracker: Arc::new(TaskTracker::new()),
         })
     }
 }
@@ -144,6 +160,8 @@ pub struct Server {
     /// (rule **K1**: spawned task must terminate when its owner drops).
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
     permissions: Arc<Permissions>,
+    lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
+    task_tracker: Arc<TaskTracker>,
 }
 
 impl Server {
@@ -164,6 +182,8 @@ impl Server {
         let document_sink = self.document_sink.clone();
         let queue_task = self.queue_task.clone();
         let permissions = self.permissions.clone();
+        let lua_evaluator = self.lua_evaluator.clone();
+        let task_tracker = self.task_tracker.clone();
 
         let join = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -177,6 +197,8 @@ impl Server {
                 document_sink,
                 queue_task,
                 permissions,
+                lua_evaluator,
+                task_tracker,
             )
         });
         join.await
@@ -240,6 +262,8 @@ fn rep_loop(
     document_sink: Option<Arc<dyn DocumentSink>>,
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
     permissions: Arc<Permissions>,
+    lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
+    task_tracker: Arc<TaskTracker>,
 ) -> Result<()> {
     while !socket.is_shutdown() {
         let req = match socket.try_recv() {
@@ -257,6 +281,8 @@ fn rep_loop(
             document_sink.clone(),
             queue_task.clone(),
             permissions.clone(),
+            lua_evaluator.clone(),
+            task_tracker.clone(),
         );
         if let Err(e) = socket.send(&resp) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");
