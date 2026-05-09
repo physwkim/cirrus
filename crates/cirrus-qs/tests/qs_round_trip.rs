@@ -47,17 +47,35 @@ fn rpc(socket: &zmq::Socket, method: &str, params: Value) -> Value {
 }
 
 fn spawn_server(reg: Registry, port: u16) -> ServerShutdown {
+    spawn_server_inner(reg, port, None)
+}
+
+fn spawn_server_with_perms(
+    reg: Registry,
+    port: u16,
+    perms_path: std::path::PathBuf,
+) -> ServerShutdown {
+    spawn_server_inner(reg, port, Some(perms_path))
+}
+
+fn spawn_server_inner(
+    reg: Registry,
+    port: u16,
+    perms_path: Option<std::path::PathBuf>,
+) -> ServerShutdown {
     let ep = endpoint(port);
-    let server = Server::builder()
+    let mut builder = Server::builder()
         .control_address(ep)
         .document_address(format!(
             "ipc:///tmp/cirrus-qs-doc-{}-{}.sock",
             std::process::id(),
             port
         ))
-        .registry(reg)
-        .build()
-        .expect("server build");
+        .registry(reg);
+    if let Some(p) = perms_path {
+        builder = builder.permissions_path(p);
+    }
+    let server = builder.build().expect("server build");
     let shutdown = server.shutdown_handle();
     tokio::spawn(async move {
         let _ = server.run_async().await;
@@ -449,18 +467,18 @@ async fn not_implemented_methods_return_defined_error() {
     let shutdown = spawn_server(reg, port);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
+    // Methods that remain registered-but-stub-only (NOT_IMPLEMENTED).
+    // permissions_reload moved out — it's now actually implemented and
+    // gated by RBAC (admin-only), tested separately below. Likewise
+    // permissions_get / manager_test / task_status / task_result return
+    // success (819bf6e wire-compat).
     for m in [
-        "permissions_reload",
-        "permissions_get",
         "permissions_set",
         "script_upload",
         "function_execute",
-        "task_result",
-        "task_status",
         "kernel_interrupt",
         "manager_stop",
         "manager_kill",
-        "manager_test",
     ] {
         let r = rpc(&req, m, json!({}));
         assert_eq!(
@@ -534,6 +552,116 @@ async fn status_includes_manager_version() {
     let s = rpc(&req, "status", json!({}));
     let v = &s["result"]["manager_version"];
     assert!(v.is_string(), "manager_version should be a string, got {v}");
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rbac_denies_mutation_for_read_only_group() {
+    // Permissions config: anonymous callers (no api_key) land in
+    // `viewer`, which is read-only. `admin-key` → admin group with full
+    // access. Read-only callers must get NOT_AUTHORIZED on mutating
+    // RPCs and success on info RPCs; admin must succeed on both.
+    let toml = r#"
+        default_group = "viewer"
+
+        [user_groups.viewer]
+        read_only = true
+        allowed_plans = []
+        allowed_devices = []
+
+        [user_groups.admin]
+        admin = true
+        allowed_plans = [".*"]
+        allowed_devices = [".*"]
+
+        [api_keys]
+        "admin-key" = "admin"
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_perms(reg, port, path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // Info RPC always succeeds — even for read_only.
+    let r = rpc(&req, "ping", json!({}));
+    assert!(r["result"]["success"].as_bool().unwrap_or(false));
+
+    // Mutation RPC: anonymous → denied (NOT_AUTHORIZED).
+    let r = rpc(&req, "queue_clear", json!({}));
+    assert_eq!(r["error"]["code"], -32001, "viewer should be denied: {r}");
+
+    // Mutation RPC: admin-key → succeeds.
+    let r = rpc(&req, "queue_clear", json!({"api_key": "admin-key"}));
+    assert!(
+        r["result"]["success"].as_bool().unwrap_or(false),
+        "admin should succeed: {r}"
+    );
+
+    // permissions_reload (Admin class): viewer denied, admin OK.
+    let r = rpc(&req, "permissions_reload", json!({}));
+    assert_eq!(r["error"]["code"], -32001, "viewer permissions_reload: {r}");
+    let r = rpc(&req, "permissions_reload", json!({"api_key": "admin-key"}));
+    assert!(
+        r["result"]["success"].as_bool().unwrap_or(false),
+        "admin permissions_reload: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rbac_filters_plan_name_on_queue_add() {
+    // viewer is read-only by default; primary allows only "count"
+    // and "scan_*". queue_item_add with plan name "fly" must be
+    // denied; "count" and "scan_grid" must pass plan-name check
+    // (they may still fail because the plan is not registered, but
+    // the *RBAC* check passes — assert by error code).
+    let toml = r#"
+        default_group = "primary"
+        [user_groups.primary]
+        allowed_plans = ["count", "scan_.*"]
+        allowed_devices = [".*"]
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_perms(reg, port, path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // "fly" is not in allowed_plans → NOT_AUTHORIZED.
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "fly", "args": []}}),
+    );
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "fly should be RBAC-denied for primary: {r}"
+    );
+
+    // "count" passes RBAC (may then fail because it's not registered
+    // in this test's empty Registry, but that's a different code).
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    assert_ne!(
+        r["error"]["code"], -32001,
+        "count should not be RBAC-denied: {r}"
+    );
+
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }

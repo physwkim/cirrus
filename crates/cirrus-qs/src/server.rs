@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
 use crate::dispatch::dispatch;
+use crate::permissions::Permissions;
 use crate::queue::PlanQueue;
 use crate::registry::Registry;
 use crate::state::{EState, EngineState};
@@ -26,6 +27,10 @@ pub struct ServerBuilder {
     /// `127.0.0.1:9090`). Only honored when the `metrics` feature
     /// is built.
     metrics_address: Option<String>,
+    /// Optional permissions.toml path. Without this, the server runs
+    /// permissive (any caller is `default_group = primary` and
+    /// `primary` allows everything).
+    permissions_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerBuilder {
@@ -35,6 +40,7 @@ impl Default for ServerBuilder {
             document_address: Some("tcp://*:60625".into()),
             registry: None,
             metrics_address: None,
+            permissions_path: None,
         }
     }
 }
@@ -60,6 +66,15 @@ impl ServerBuilder {
     /// Without the feature this is a no-op.
     pub fn metrics_address(mut self, addr: impl Into<String>) -> Self {
         self.metrics_address = Some(addr.into());
+        self
+    }
+    /// Load RBAC policy from a TOML file. The dispatcher consults the
+    /// loaded policy on every request and returns
+    /// `codes::NOT_AUTHORIZED` for denied calls. Without this, the
+    /// server runs permissive — every method is allowed for the
+    /// `default_group = primary`.
+    pub fn permissions_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.permissions_path = Some(path.into());
         self
     }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
@@ -96,6 +111,13 @@ impl ServerBuilder {
                 "metrics_address set but cirrus-qs was built without --features metrics; ignoring"
             );
         }
+        let permissions = match self.permissions_path.as_deref() {
+            Some(p) => Arc::new(
+                Permissions::load_from_file(p)
+                    .map_err(|e| CirrusError::State(format!("permissions: {e}")))?,
+            ),
+            None => Arc::new(Permissions::permissive()),
+        };
         Ok(Server {
             socket,
             document_sink,
@@ -104,6 +126,7 @@ impl ServerBuilder {
             state: Arc::new(StdMutex::new(EngineState::initial())),
             engine: Arc::new(Mutex::new(None)),
             queue_task: Arc::new(StdMutex::new(None)),
+            permissions,
         })
     }
 }
@@ -120,6 +143,7 @@ pub struct Server {
     /// Stored so [`ServerShutdown::shutdown`] can stop the worker mid-plan
     /// (rule **K1**: spawned task must terminate when its owner drops).
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    permissions: Arc<Permissions>,
 }
 
 impl Server {
@@ -139,6 +163,7 @@ impl Server {
         let engine = self.engine.clone();
         let document_sink = self.document_sink.clone();
         let queue_task = self.queue_task.clone();
+        let permissions = self.permissions.clone();
 
         let join = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -151,6 +176,7 @@ impl Server {
                 engine,
                 document_sink,
                 queue_task,
+                permissions,
             )
         });
         join.await
@@ -213,6 +239,7 @@ fn rep_loop(
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    permissions: Arc<Permissions>,
 ) -> Result<()> {
     while !socket.is_shutdown() {
         let req = match socket.try_recv() {
@@ -229,6 +256,7 @@ fn rep_loop(
             engine.clone(),
             document_sink.clone(),
             queue_task.clone(),
+            permissions.clone(),
         );
         if let Err(e) = socket.send(&resp) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");

@@ -89,4 +89,7 @@ pub mod codes {
     pub const NOT_IMPLEMENTED: i64 = -32099;
     /// Generic queueserver application error.
     pub const QSERVER: i64 = -32000;
+    /// RBAC denial — caller's group is not authorized for the
+    /// requested method or for the plan/device named in params.
+    pub const NOT_AUTHORIZED: i64 = -32001;
 }

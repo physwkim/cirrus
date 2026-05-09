@@ -37,6 +37,13 @@ pub struct ManagerArgs {
     /// is ignored.
     #[arg(long)]
     metrics: Option<String>,
+
+    /// Optional path to a permissions.toml file that gates JSON-RPC
+    /// methods by user group. Without this flag, the server runs
+    /// permissive — every method is allowed for every caller.
+    /// Callers identify themselves by `params.api_key`.
+    #[arg(long)]
+    permissions: Option<std::path::PathBuf>,
 }
 
 /// Entry point — returns a process exit code.
@@ -69,6 +76,9 @@ pub async fn run(args: ManagerArgs) -> i32 {
         .registry(reg);
     if let Some(addr) = &args.metrics {
         sb = sb.metrics_address(addr);
+    }
+    if let Some(path) = &args.permissions {
+        sb = sb.permissions_path(path.clone());
     }
     let server = match sb.build() {
         Ok(s) => s,

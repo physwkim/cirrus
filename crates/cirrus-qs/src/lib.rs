@@ -30,18 +30,35 @@
 //!   (`re_state`, `worker_environment_*`, `queue_*_uid`, `lock_info_uid`,
 //!   etc.)
 //!
+//! ## RBAC (opt-in)
+//!
+//! Without a `permissions.toml`, cirrus-qs runs *permissive* — every
+//! method is allowed for every caller. Pass
+//! [`ServerBuilder::permissions_path`] (or `cirrus qs-manager
+//! --permissions <PATH>`) to enforce per-group ACLs:
+//!
+//! - `Info` methods (`ping`, `status`, `*_get`, listings) — always allowed.
+//! - `QueueAdd` methods — `params.item.name` is matched against the
+//!   group's `allowed_plans` regex set.
+//! - `QueueMutate` (queue / RE / environment writes) — denied for
+//!   `read_only` groups.
+//! - `Admin` (`permissions_*`, `manager_kill`, ...) — only for
+//!   `admin = true` groups.
+//!
+//! Callers identify themselves by `params.api_key`; without one, the
+//! caller resolves to `default_group`.
+//!
 //! ## What returns NOT_IMPLEMENTED (registered, but stub-only)
 //!
 //! These methods are declared in the dispatch table so clients see a
 //! defined error code instead of `METHOD_NOT_FOUND`. They are
 //! bluesky-queueserver-specific and don't translate to cirrus's
-//! single-binary, no-IPython, no-permission-ACL model:
+//! single-binary, no-IPython model:
 //!
-//! - `permissions_reload`, `permissions_get`, `permissions_set`
+//! - `permissions_set`
 //! - `script_upload`, `function_execute`
-//! - `task_result`, `task_status`
 //! - `kernel_interrupt`
-//! - `manager_stop`, `manager_kill`, `manager_test`
+//! - `manager_stop`, `manager_kill`
 //!
 //! ## Example
 //!
@@ -72,6 +89,7 @@ mod dispatch;
 mod methods;
 #[cfg(feature = "metrics")]
 mod metrics;
+pub mod permissions;
 mod queue;
 mod registry;
 mod server;
@@ -79,6 +97,7 @@ mod state;
 mod transport;
 
 pub use methods::{JsonRpcError, RpcRequest, RpcResponse};
+pub use permissions::{MethodClass, Permissions};
 pub use queue::{PlanQueue, QueuedItem};
 pub use registry::{PlanFactory, Registry};
 pub use server::{Server, ServerBuilder, ServerShutdown};

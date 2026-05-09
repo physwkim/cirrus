@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
 use crate::methods::{codes, RpcRequest, RpcResponse};
+use crate::permissions::Permissions;
 use crate::queue::{PlanQueue, QueuedItem};
 use crate::registry::Registry;
 use crate::state::{EState, EngineState};
@@ -33,12 +34,21 @@ pub(crate) fn dispatch(
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
     queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    permissions: Arc<Permissions>,
 ) -> RpcResponse {
     let id = req.id.clone();
     let m = req.method.as_str();
 
     #[cfg(feature = "metrics")]
     crate::metrics::rpc_call(m);
+
+    // RBAC gate: classify the method and check the caller's group.
+    let group = permissions.resolve_group(&req.params);
+    if let Err(reason) = permissions.check(m, &req.params, &group) {
+        #[cfg(feature = "metrics")]
+        crate::metrics::rpc_error(m);
+        return RpcResponse::err(id, codes::NOT_AUTHORIZED, reason);
+    }
 
     // Lock check: any method that mutates queue / environment is gated
     // by lock state (mirrors bluesky's lock semantics).
@@ -243,22 +253,22 @@ pub(crate) fn dispatch(
             json!({
                 "success": true,
                 "msg": "",
-                // cirrus-qs has no RBAC layer yet — return the
-                // permissive default that allows everything.
-                "user_group_permissions": {
-                    "user_groups": {
-                        "root": {"allowed_plans": [".*"], "allowed_devices": [".*"]},
-                        "primary": {"allowed_plans": [".*"], "allowed_devices": [".*"]},
-                    },
-                },
-                "user_group_permissions_uid": "static",
+                "user_group_permissions": permissions.snapshot_for_get(),
+                "user_group_permissions_uid": permissions_uid(&permissions),
             }),
         ),
+        "permissions_reload" => match permissions.reload() {
+            Ok(()) => RpcResponse::ok(id, json!({"success": true, "msg": "permissions reloaded"})),
+            Err(e) => RpcResponse::err(
+                id,
+                codes::QSERVER,
+                format!("permissions_reload: {e}"),
+            ),
+        },
 
         // -- not-implemented stubs (registered so clients see the method
         //    name but get a defined error). --------------------------------
-        "permissions_reload"
-        | "permissions_set"
+        "permissions_set"
         | "script_upload"
         | "function_execute"
         | "kernel_interrupt"
@@ -277,6 +287,17 @@ pub(crate) fn dispatch(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+/// UID for a Permissions snapshot. Hashes the JSON shape so that
+/// `permissions_get` returns a stable string between reloads, and a
+/// new string after `permissions_reload`.
+fn permissions_uid(p: &Permissions) -> String {
+    let snap = p.snapshot_for_get();
+    let body = serde_json::to_string(&snap).unwrap_or_default();
+    let mut h = DefaultHasher::new();
+    body.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
 
 fn lock_check(method: &str, state: &Arc<StdMutex<EngineState>>, params: &Value) -> bool {
     // Methods that don't mutate state are always allowed.

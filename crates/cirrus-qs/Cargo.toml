@@ -22,6 +22,8 @@ cirrus-event-model.workspace = true
 cirrus-plans.workspace = true
 cirrus-callbacks = { workspace = true, features = ["zmq"] }
 zmq = "0.10"
+regex = "1"
+toml = "0.8"
 
 # Optional Prometheus metrics endpoint.
 metrics = { version = "0.24", optional = true }
@@ -34,3 +36,4 @@ metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 cirrus-backend-soft = { path = "../cirrus-backends/soft" }
+tempfile = "3"
