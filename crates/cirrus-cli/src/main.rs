@@ -20,6 +20,7 @@ mod lua_env;
 #[cfg(feature = "tiled")]
 mod lua_tiled;
 mod manager;
+mod manager_lua;
 mod migrate;
 mod repl;
 

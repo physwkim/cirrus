@@ -15,7 +15,12 @@ pub type PlanFactory =
 
 /// Registered devices, indexed by string name. The same physical device
 /// usually appears under more than one trait — register each role explicitly.
-#[derive(Default)]
+///
+/// `Clone` is implemented (cheap — every value is an `Arc<dyn ...>`)
+/// so callers can share the registry between the `Server` and a
+/// daemon-side evaluator that publishes the same devices into a Lua
+/// state.
+#[derive(Clone, Default)]
 pub struct Registry {
     plans: HashMap<String, PlanFactory>,
     readables: HashMap<String, Arc<dyn ReadableObj>>,
@@ -75,6 +80,26 @@ impl Registry {
     /// Look up a `MovableObj` by name.
     pub fn movable(&self, name: &str) -> Option<&Arc<dyn MovableObj>> {
         self.movables.get(name)
+    }
+
+    /// Look up a `TriggerableObj` by name.
+    pub fn triggerable(&self, name: &str) -> Option<&Arc<dyn TriggerableObj>> {
+        self.triggerables.get(name)
+    }
+
+    /// Look up a `StageableObj` by name.
+    pub fn stageable(&self, name: &str) -> Option<&Arc<dyn StageableObj>> {
+        self.stageables.get(name)
+    }
+
+    /// Look up a `FlyableObj` by name.
+    pub fn flyable(&self, name: &str) -> Option<&Arc<dyn FlyableObj>> {
+        self.flyables.get(name)
+    }
+
+    /// Look up a `CollectableObj` by name.
+    pub fn collectable(&self, name: &str) -> Option<&Arc<dyn CollectableObj>> {
+        self.collectables.get(name)
     }
 
     /// Look up a registered plan factory by name.

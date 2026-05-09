@@ -36,6 +36,11 @@ pub struct ServerBuilder {
     /// Optional Lua evaluator. Without this, the `lua_eval` RPC
     /// returns `NOT_IMPLEMENTED`.
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
+    /// Optional pre-allocated engine slot. The daemon-side Lua
+    /// bridge needs to share the slot with the server so it can
+    /// resolve `RE` lazily; supplying it here avoids constructing
+    /// two slots that fight over the same engine identity.
+    engine_slot: Option<Arc<Mutex<Option<Arc<RunEngine>>>>>,
 }
 
 impl Default for ServerBuilder {
@@ -47,6 +52,7 @@ impl Default for ServerBuilder {
             metrics_address: None,
             permissions_path: None,
             lua_evaluator: None,
+            engine_slot: None,
         }
     }
 }
@@ -91,6 +97,14 @@ impl ServerBuilder {
         self.lua_evaluator = Some(ev);
         self
     }
+    /// Override the engine slot. Lets a daemon-side bridge share the
+    /// same `Arc<Mutex<Option<Arc<RunEngine>>>>` with the server, so
+    /// when `environment_open` populates it the bridge sees the same
+    /// engine. If unset, the server builds a fresh empty slot.
+    pub fn engine_slot(mut self, slot: Arc<Mutex<Option<Arc<RunEngine>>>>) -> Self {
+        self.engine_slot = Some(slot);
+        self
+    }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
     pub fn build(self) -> Result<Server> {
         let registry = self
@@ -132,13 +146,16 @@ impl ServerBuilder {
             ),
             None => Arc::new(Permissions::permissive()),
         };
+        let engine = self
+            .engine_slot
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
         Ok(Server {
             socket,
             document_sink,
             registry: Arc::new(registry),
             queue: Arc::new(StdMutex::new(PlanQueue::new())),
             state: Arc::new(StdMutex::new(EngineState::initial())),
-            engine: Arc::new(Mutex::new(None)),
+            engine,
             queue_task: Arc::new(StdMutex::new(None)),
             permissions,
             lua_evaluator: self.lua_evaluator,

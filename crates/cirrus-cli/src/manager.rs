@@ -6,6 +6,9 @@ use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{MovableObj, ReadableObj};
 use cirrus_qs::{Registry, Server};
 use clap::Args;
+use tokio::sync::Mutex as TMutex;
+
+use crate::manager_lua::ManagerLuaState;
 
 /// Arguments for `cirrus qs-manager`.
 #[derive(Args, Debug)]
@@ -70,10 +73,20 @@ pub async fn run(args: ManagerArgs) -> i32 {
     }
     reg.register_plan_count("count");
 
+    // Share the engine slot + registry between Server and the
+    // daemon-side Lua bridge so `lua_eval` resolves the same `RE`
+    // and the same registered devices the queue worker sees.
+    let engine_slot = Arc::new(TMutex::new(None));
+    let registry_for_lua = Arc::new(reg.clone());
+    let evaluator: Arc<dyn cirrus_qs::LuaEvaluator> =
+        Arc::new(ManagerLuaState::new(engine_slot.clone(), registry_for_lua));
+
     let mut sb = Server::builder()
         .control_address(&args.control)
         .document_address(&args.documents)
-        .registry(reg);
+        .registry(reg)
+        .engine_slot(engine_slot)
+        .lua_evaluator(evaluator);
     if let Some(addr) = &args.metrics {
         sb = sb.metrics_address(addr);
     }
