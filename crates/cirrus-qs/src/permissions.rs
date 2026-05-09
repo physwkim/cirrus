@@ -300,8 +300,10 @@ impl Permissions {
         g.default_group.clone()
     }
 
-    /// Authorize `method` for `group`. On `QueueAdd`, also validate the
-    /// plan name in `params["item"]["name"]` (queueserver convention).
+    /// Authorize `method` for `group`. On `QueueAdd`, also validate
+    /// **every** plan name in `params["item"]["name"]` /
+    /// `params["items"][].name` (queueserver convention) — denying if
+    /// *any* item is outside the group's `allowed_plans`.
     /// Returns `Ok(())` on success, `Err(reason)` on denial.
     ///
     /// When `Permissions` was built via [`Self::permissive`] (no file
@@ -324,7 +326,7 @@ impl Permissions {
                         "RBAC: group {group:?} is read-only; '{method}' denied"
                     ));
                 }
-                if let Some(name) = plan_name_from_params(params) {
+                for name in plan_names_from_params(params) {
                     if !policy.plan_allowed(&name) {
                         return Err(format!(
                             "RBAC: group {group:?} not allowed to run plan {name:?}"
@@ -354,6 +356,17 @@ impl Permissions {
         }
     }
 
+    /// True if `group` has `admin = true`. Used by the dispatcher to
+    /// gate per-task lookups (admin-originated task results stay
+    /// readable only by other admins).
+    pub fn is_admin(&self, group: &str) -> bool {
+        let g = self.inner.read().unwrap();
+        if !g.enforced {
+            return true;
+        }
+        g.groups.get(group).map(|p| p.admin).unwrap_or(false)
+    }
+
     /// Snapshot the current policy for `permissions_get`. Returns a
     /// JSON object that mirrors the bluesky-queueserver
     /// `user_group_permissions` shape:
@@ -380,24 +393,28 @@ impl Permissions {
     }
 }
 
-fn plan_name_from_params(params: &Value) -> Option<String> {
-    // bluesky shape: params.item.name (QueueAdd), params.items[].name
-    // (QueueAddBatch). Try each in order; if neither, skip the check.
+/// Extract every plan name from a queueserver-shape `params`:
+/// `params.item.name` (single-add) or every entry of
+/// `params.items[].name` (batch-add). Returning all names lets the
+/// caller reject when *any* item is outside the policy — fixes a
+/// batch-add bypass where only the first plan name was checked.
+fn plan_names_from_params(params: &Value) -> Vec<String> {
+    let mut out = Vec::new();
     if let Some(name) = params
         .get("item")
         .and_then(|v| v.get("name"))
         .and_then(|v| v.as_str())
     {
-        return Some(name.to_string());
+        out.push(name.to_string());
     }
     if let Some(arr) = params.get("items").and_then(|v| v.as_array()) {
         for it in arr {
             if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
-                return Some(name.to_string());
+                out.push(name.to_string());
             }
         }
     }
-    None
+    out
 }
 
 #[cfg(test)]
@@ -477,6 +494,62 @@ mod tests {
         assert_eq!(p.resolve_group(&json!({"api_key": "k-view"})), "viewer");
         assert_eq!(p.resolve_group(&json!({})), "primary");
         assert_eq!(p.resolve_group(&json!({"api_key": "unknown"})), "primary");
+    }
+
+    #[test]
+    fn batch_add_denies_when_any_item_disallowed() {
+        // R1.1: a malicious caller could pass [{name: "count"}, {name:
+        // "fly"}] and the prior single-name check would let it through.
+        // Now ALL items are validated.
+        let toml = r#"
+            default_group = "scientist"
+            [user_groups.scientist]
+            allowed_plans = ["count"]
+            allowed_devices = [".*"]
+        "#;
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), toml).unwrap();
+        let p = Permissions::load_from_file(path.path()).unwrap();
+
+        // Single allowed name → ok.
+        assert!(p
+            .check(
+                "queue_item_add_batch",
+                &json!({"items": [{"name": "count"}]}),
+                "scientist"
+            )
+            .is_ok());
+
+        // Two items, second disallowed → must deny.
+        let r = p.check(
+            "queue_item_add_batch",
+            &json!({"items": [{"name": "count"}, {"name": "fly"}]}),
+            "scientist",
+        );
+        assert!(r.is_err(), "expected deny, got {r:?}");
+        assert!(
+            r.unwrap_err().contains("fly"),
+            "error must name the offending plan"
+        );
+    }
+
+    #[test]
+    fn is_admin_reflects_group_flag() {
+        let toml = r#"
+            default_group = "primary"
+            [user_groups.primary]
+            allowed_plans = [".*"]
+            [user_groups.boss]
+            admin = true
+            allowed_plans = [".*"]
+        "#;
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), toml).unwrap();
+        let p = Permissions::load_from_file(path.path()).unwrap();
+        assert!(!p.is_admin("primary"));
+        assert!(p.is_admin("boss"));
+        // Permissive default treats everyone as admin (enforcement off).
+        assert!(Permissions::permissive().is_admin("anyone"));
     }
 
     #[test]

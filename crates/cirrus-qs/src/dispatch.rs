@@ -253,6 +253,12 @@ pub(crate) fn dispatch(
                 .get("task_uid")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Per-task RBAC: if the originating method was Admin
+            // class, only admin callers may poll the result. Without
+            // this, a viewer could read admin-only `lua_eval` output.
+            if let Err(reason) = check_task_access(uid, &group, &task_tracker, &permissions) {
+                return RpcResponse::err(id, codes::NOT_AUTHORIZED, reason);
+            }
             // Tracker is authoritative for tasks we registered; fall
             // back to "completed" for unknown uids so naive bluesky
             // clients (that synthesize uids on the client side) still
@@ -274,6 +280,9 @@ pub(crate) fn dispatch(
                 .get("task_uid")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            if let Err(reason) = check_task_access(uid, &group, &task_tracker, &permissions) {
+                return RpcResponse::err(id, codes::NOT_AUTHORIZED, reason);
+            }
             let status = task_tracker.status(uid).unwrap_or("completed");
             let (success, return_value, traceback) = match task_tracker.result(uid) {
                 Some(r) => (
@@ -329,7 +338,7 @@ pub(crate) fn dispatch(
                 }
             };
             let task_uid = uuid::Uuid::new_v4().to_string();
-            task_tracker.start(&task_uid);
+            task_tracker.start(&task_uid, "lua_eval");
             let tracker = task_tracker.clone();
             let uid_for_task = task_uid.clone();
             rt.spawn(async move {
@@ -384,6 +393,36 @@ pub(crate) fn dispatch(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+/// Per-task RBAC gate for `task_status` / `task_result`. If the uid
+/// is unknown, allow (legacy bluesky-queueserver clients synthesize
+/// uids client-side and expect "completed"). If known and the
+/// originating method was Admin class, require admin caller.
+fn check_task_access(
+    uid: &str,
+    caller_group: &str,
+    tracker: &Arc<TaskTracker>,
+    permissions: &Arc<Permissions>,
+) -> Result<(), String> {
+    let Some(source) = tracker.source_method(uid) else {
+        return Ok(());
+    };
+    if classify_local(&source) == crate::permissions::MethodClass::Admin
+        && !permissions.is_admin(caller_group)
+    {
+        return Err(format!(
+            "RBAC: task {uid:?} originated from admin-class method '{source}'; \
+             non-admin caller cannot poll its status / result"
+        ));
+    }
+    Ok(())
+}
+
+/// Local re-export of the classify function so the dispatcher
+/// doesn't need to import the entire `permissions` namespace.
+fn classify_local(method: &str) -> crate::permissions::MethodClass {
+    crate::permissions::classify(method)
+}
 
 /// UID for a Permissions snapshot. Hashes the JSON shape so that
 /// `permissions_get` returns a stable string between reloads, and a

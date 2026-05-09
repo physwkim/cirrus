@@ -43,6 +43,11 @@ struct TaskEntry {
     state: TaskState,
     #[allow(dead_code)]
     started_at: Instant,
+    /// Method that originated this task (e.g. `"lua_eval"`). The
+    /// dispatcher gates `task_status` / `task_result` so an
+    /// admin-only originating method's outputs aren't readable by
+    /// non-admin pollers — see `Permissions::is_admin`.
+    source_method: String,
 }
 
 #[derive(Debug)]
@@ -76,9 +81,11 @@ impl TaskTracker {
         }
     }
 
-    /// Register a new task as `Running`. Caller is responsible for
-    /// generating a unique `uid` (typically a UUID).
-    pub fn start(&self, uid: &str) {
+    /// Register a new task as `Running`. `source_method` is the RPC
+    /// method name that originated this task (e.g. `"lua_eval"`); the
+    /// dispatcher uses it to decide whether non-admin callers may
+    /// poll the result.
+    pub fn start(&self, uid: &str, source_method: &str) {
         let mut g = self.inner.write().unwrap();
         // Evict oldest if at capacity (don't let a runaway client
         // exhaust memory by spamming task creates).
@@ -92,9 +99,17 @@ impl TaskTracker {
             TaskEntry {
                 state: TaskState::Running,
                 started_at: Instant::now(),
+                source_method: source_method.to_string(),
             },
         );
         g.order.push_back(uid.to_string());
+    }
+
+    /// Method that originated `uid`, if known. `None` for unknown
+    /// uids — caller falls back to the legacy "completed" stub.
+    pub fn source_method(&self, uid: &str) -> Option<String> {
+        let g = self.inner.read().unwrap();
+        g.entries.get(uid).map(|e| e.source_method.clone())
     }
 
     /// Mark `uid` as finished with the supplied result. No-op if the
@@ -160,7 +175,7 @@ mod tests {
     #[test]
     fn start_then_complete_transitions_state() {
         let t = TaskTracker::new();
-        t.start("u1");
+        t.start("u1", "test");
         assert_eq!(t.status("u1"), Some("running"));
         assert!(t.result("u1").is_none());
         t.complete("u1", ok_result("hi"));
@@ -173,7 +188,7 @@ mod tests {
     #[test]
     fn failed_eval_reports_failed_status() {
         let t = TaskTracker::new();
-        t.start("u2");
+        t.start("u2", "test");
         t.complete(
             "u2",
             EvalResult {
@@ -190,7 +205,7 @@ mod tests {
     fn fifo_evicts_oldest_at_capacity() {
         let t = TaskTracker::new();
         for i in 0..MAX_TASKS + 5 {
-            t.start(&format!("u{i}"));
+            t.start(&format!("u{i}"), "test");
             t.complete(&format!("u{i}"), ok_result(""));
         }
         // First 5 evicted.

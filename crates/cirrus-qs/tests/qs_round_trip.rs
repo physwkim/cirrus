@@ -872,3 +872,88 @@ async fn lua_eval_without_evaluator_returns_not_implemented() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rbac_admin_task_result_blocked_for_non_admin() {
+    // R1.2: admin runs `lua_eval`; the task's stdout / return value
+    // would leak to a viewer polling task_status / task_result if the
+    // dispatcher classified those as plain Info. Per-task RBAC gate
+    // requires the caller to be admin when the originating method
+    // was admin-class.
+    let toml = r#"
+        default_group = "viewer"
+
+        [user_groups.viewer]
+        read_only = true
+        allowed_plans = []
+        allowed_devices = []
+
+        [user_groups.boss]
+        admin = true
+        allowed_plans = [".*"]
+        allowed_devices = [".*"]
+
+        [api_keys]
+        "boss-key" = "boss"
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let port = rand_port();
+    let reg = Registry::new();
+    let server = Server::builder()
+        .control_address(endpoint(port))
+        .document_address(format!(
+            "ipc:///tmp/cirrus-qs-doc-{}-{}.sock",
+            std::process::id(),
+            port
+        ))
+        .registry(reg)
+        .permissions_path(path)
+        .lua_evaluator(Arc::new(MockEval))
+        .build()
+        .expect("server build");
+    let shutdown = server.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = server.run_async().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // Admin issues lua_eval, gets a task_uid.
+    let r = rpc(
+        &req,
+        "lua_eval",
+        json!({"source": "0", "api_key": "boss-key"}),
+    );
+    let uid = r["result"]["task_uid"]
+        .as_str()
+        .expect("task_uid")
+        .to_string();
+
+    // Viewer (no api_key) tries to poll status — must be denied.
+    let r = rpc(&req, "task_status", json!({"task_uid": uid}));
+    assert_eq!(r["error"]["code"], -32001, "viewer should be denied: {r}");
+
+    // Viewer tries task_result — also denied.
+    let r = rpc(&req, "task_result", json!({"task_uid": uid}));
+    assert_eq!(
+        r["error"]["code"], -32001,
+        "viewer task_result should be denied: {r}"
+    );
+
+    // Admin can poll fine.
+    let r = rpc(
+        &req,
+        "task_status",
+        json!({"task_uid": uid, "api_key": "boss-key"}),
+    );
+    assert!(
+        r["result"]["status"].as_str().is_some(),
+        "admin task_status should succeed: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
