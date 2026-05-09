@@ -925,3 +925,176 @@ pub fn fly(
         };
     })
 }
+
+/// `adaptive_scan(detectors, signal_field, motor, motor_reader, start,
+/// stop, min_step, max_step, target_delta, backstep)` — adaptive
+/// step-sized 1-D scan. Mirrors bluesky's `adaptive_scan`.
+///
+/// At each step, reads `signal_field` from the first detector's
+/// reading. Compares delta to the previous reading:
+/// - If `|delta|` exceeds `target_delta * 1.5`, the next step
+///   shrinks (toward `min_step`) and optionally back-steps (when
+///   `backstep=true`) to capture the missed transition.
+/// - If `|delta|` is well below `target_delta * 0.5`, the next step
+///   doubles (toward `max_step`).
+///
+/// Useful for scanning across a peak / edge where uniform-step
+/// density would either miss the feature or oversample the flat
+/// regions.
+#[allow(clippy::too_many_arguments)]
+pub fn adaptive_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    signal_field: impl Into<String>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    min_step: f64,
+    max_step: f64,
+    target_delta: f64,
+    backstep: bool,
+) -> Plan {
+    let signal_field = signal_field.into();
+    let mid_step = (min_step + max_step) * 0.5;
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("adaptive_scan".into()),
+            ..Default::default()
+        });
+        let direction = if stop >= start { 1.0_f64 } else { -1.0 };
+        let mut pos = start;
+        let mut prev_signal: Option<f64> = None;
+        let mut step = mid_step.max(min_step.min(max_step));
+        let max_iters = 10_000_usize;
+        let mut iter = 0_usize;
+        loop {
+            iter += 1;
+            if iter > max_iters {
+                break;
+            }
+            if (direction > 0.0 && pos > stop) || (direction < 0.0 && pos < stop) {
+                break;
+            }
+            yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
+            yield Msg::Wait {
+                group: "set".into(),
+                error_on_timeout: true,
+                timeout: None,
+            };
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Read(motor_reader.clone());
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+            // Best-effort signal sample for adaptation. We don't
+            // have direct access to the value yielded into the
+            // bundler from this side of the plan stream, so we
+            // re-read the first detector. For soft / fast-read
+            // detectors this is cheap; for slow ones consider a
+            // separate signal channel.
+            let now_signal: Option<f64> = if let Some(d) = detectors.first() {
+                if let Ok(map) = d.read_dyn().await {
+                    map.get(&signal_field).and_then(|rv| rv.value.as_f64())
+                } else { None }
+            } else { None };
+            let next_step = match (prev_signal, now_signal) {
+                (Some(p), Some(n)) => {
+                    let abs_delta = (n - p).abs();
+                    if abs_delta > target_delta * 1.5 {
+                        let new_step = (step * 0.5).max(min_step);
+                        if backstep && new_step < step {
+                            pos -= step * direction;
+                        }
+                        new_step
+                    } else if abs_delta < target_delta * 0.5 {
+                        (step * 2.0).min(max_step)
+                    } else {
+                        step
+                    }
+                }
+                _ => step,
+            };
+            prev_signal = now_signal.or(prev_signal);
+            step = next_step.clamp(min_step, max_step);
+            pos += step * direction;
+        }
+        yield Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    })
+}
+
+/// `tune_centroid(detectors, signal_field, motor, motor_reader, start,
+/// stop, num)` — a uniform scan that finds the centroid of
+/// `signal_field` across the detector readings, then sets `motor`
+/// to that centroid. Mirrors a simplified bluesky `tune_centroid`.
+///
+/// Centroid = `Σ(pos_i * sig_i) / Σ(sig_i)`. If all signals are zero
+/// (or non-numeric), the motor stops at the last scan position.
+#[allow(clippy::too_many_arguments)]
+pub fn tune_centroid(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    signal_field: impl Into<String>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+) -> Plan {
+    let signal_field = signal_field.into();
+    let step = if num > 1 {
+        (stop - start) / (num as f64 - 1.0)
+    } else {
+        0.0
+    };
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(RunMetadata {
+            plan_name: Some("tune_centroid".into()),
+            ..Default::default()
+        });
+        let mut sum_xy = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        let mut last_pos = start;
+        for i in 0..num {
+            let pos = start + step * (i as f64);
+            last_pos = pos;
+            yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
+            yield Msg::Wait {
+                group: "set".into(),
+                error_on_timeout: true,
+                timeout: None,
+            };
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Read(motor_reader.clone());
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+            if let Some(d) = detectors.first() {
+                if let Ok(map) = d.read_dyn().await {
+                    if let Some(y) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
+                        sum_xy += pos * y;
+                        sum_y += y;
+                    }
+                }
+            }
+        }
+        let target = if sum_y.abs() > f64::EPSILON {
+            sum_xy / sum_y
+        } else {
+            last_pos
+        };
+        yield Msg::Set { obj: motor.clone(), value: target, group: Some("center".into()) };
+        yield Msg::Wait {
+            group: "center".into(),
+            error_on_timeout: true,
+            timeout: None,
+        };
+        yield Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    })
+}

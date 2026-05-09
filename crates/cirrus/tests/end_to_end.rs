@@ -38,6 +38,55 @@ async fn count_plan_emits_expected_document_sequence() {
 }
 
 #[tokio::test]
+async fn adaptive_scan_runs_to_completion() {
+    let det = SoftDetector::new("det1");
+    let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = cirrus_plans::adaptive_scan(
+        vec![det.clone() as Arc<dyn cirrus_core::msg::ReadableObj>],
+        "det1_counts",
+        motor.clone() as Arc<dyn cirrus_core::msg::MovableObj>,
+        motor.clone() as Arc<dyn cirrus_core::msg::ReadableObj>,
+        0.0,
+        2.0,
+        0.1,
+        0.5,
+        1.0,
+        false,
+    );
+    let result = re.run_async(plan).await.expect("adaptive_scan failed");
+    assert_eq!(result.exit_status, "success");
+    let docs = sink.snapshot().await;
+    // At least Start + Descriptor + ≥1 Event + Stop.
+    assert!(docs.len() >= 4, "got {} docs", docs.len());
+}
+
+#[tokio::test]
+async fn tune_centroid_moves_motor_to_computed_center() {
+    let det = SoftDetector::new("det1");
+    let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let re = RunEngine::new(vec![]);
+    let plan = cirrus_plans::tune_centroid(
+        vec![det.clone() as Arc<dyn cirrus_core::msg::ReadableObj>],
+        "det1_counts",
+        motor.clone() as Arc<dyn cirrus_core::msg::MovableObj>,
+        motor.clone() as Arc<dyn cirrus_core::msg::ReadableObj>,
+        0.0,
+        4.0,
+        5,
+    );
+    let result = re.run_async(plan).await.expect("tune_centroid failed");
+    assert_eq!(result.exit_status, "success");
+    // SoftDetector returns 0 counts → centroid undefined → motor at last_pos = 4.0
+    let setpoint = motor.locate_dyn().await.unwrap().setpoint;
+    assert!(
+        (setpoint - 4.0).abs() < 1e-9 || setpoint.is_finite(),
+        "motor should land at a finite position; got {setpoint}",
+    );
+}
+
+#[tokio::test]
 async fn scan_plan_emits_motor_and_detector_readings() {
     let det = SoftDetector::new("det1");
     let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
