@@ -484,7 +484,8 @@ m:move_to(1.5)
 assert(m:position() == 1.5)
 
 local s = m:set(2.0)
-assert(s:done() == false)
+-- SoftMotor.set returns an already-done Status (sync backend); wait
+-- is a no-op but kept for the bluesky-style call shape.
 s:wait()
 assert(s:done() == true)
 assert(m:position() == 2.0)
@@ -524,20 +525,25 @@ d:set(1.0)   -- soft detector is not movable
 }
 
 #[test]
-fn device_status_double_wait_errors() {
-    let (_out, err, code) = run_script(
+fn device_status_wait_is_idempotent() {
+    // Status is `Clone` (Arc-shared inner state); `:wait()` is now
+    // idempotent and `:done()` / `:success()` / `:exception()` /
+    // `:inspect()` work both before and after `:wait()`. This was a
+    // single-use semantics in earlier prototypes — see Phase C.
+    let (out, err, code) = run_script(
         r#"
 local m = soft_motor("m1", 0.0)
 local s = m:set(1.0)
 s:wait()
-s:wait()    -- second wait must error: Status is single-use
+s:wait()    -- second wait must NOT error: Status is now idempotent
+assert(s:done() == true)
+assert(s:success() == true)
+assert(s:exception() == nil)
+print("OK")
 "#,
     );
-    assert_ne!(code, 0);
-    assert!(
-        err.contains("already awaited"),
-        "stderr should mention 'already awaited', got: {err}"
-    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OK"), "out: {out}");
 }
 
 #[test]

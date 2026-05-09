@@ -96,13 +96,30 @@ impl ManagerLuaState {
     }
 }
 
+/// Acquire a poison-resistant lock on the shared Lua state. If a
+/// prior `eval()` panicked while holding the mutex (e.g. an mlua
+/// bug), the standard `lock().unwrap()` would propagate the panic
+/// to every subsequent caller. Recover via `into_inner()` — Lua's
+/// internal state is robust enough to keep using even after a
+/// caller-side panic, and the alternative (denying all future
+/// evals) is worse for an attached debug session.
+fn lock_recover<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::warn!("lua_eval: shared Lua state mutex was poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 #[async_trait]
 impl LuaEvaluator for ManagerLuaState {
     async fn eval(&self, source: &str) -> EvalResult {
         // Lazy-build the Lua state if it doesn't exist yet. We need
         // to do this on the async side because we lock the engine
         // slot (a tokio mutex).
-        if self.lua.lock().unwrap().is_none() {
+        if lock_recover(&self.lua).is_none() {
             let re = match self.engine_slot.lock().await.as_ref() {
                 Some(e) => e.clone(),
                 None => {
@@ -118,7 +135,7 @@ impl LuaEvaluator for ManagerLuaState {
                 }
             };
             match Self::build_state(re, &self.registry) {
-                Ok(l) => *self.lua.lock().unwrap() = Some(l),
+                Ok(l) => *lock_recover(&self.lua) = Some(l),
                 Err(e) => {
                     return EvalResult {
                         stdout: String::new(),
@@ -135,8 +152,20 @@ impl LuaEvaluator for ManagerLuaState {
         let lua = self.lua.clone();
         let src = source.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut g = lua.lock().unwrap();
-            let lua_ref = g.as_mut().expect("lua state was built above");
+            let mut g = lock_recover(&lua);
+            let lua_ref = match g.as_mut() {
+                Some(l) => l,
+                None => {
+                    // Should not happen — the lazy-init above ran in
+                    // the async path. If we somehow get here, surface
+                    // a clean error rather than panicking.
+                    return EvalResult {
+                        stdout: String::new(),
+                        return_value: None,
+                        error: Some("lua_eval: state vanished between init and eval".into()),
+                    };
+                }
+            };
             eval_in(lua_ref, &src)
         })
         .await
@@ -163,7 +192,12 @@ fn eval_in(lua: &Lua, source: &str) -> EvalResult {
         for v in args.iter() {
             parts.push(value_to_string(v));
         }
-        cap_for_fn.lock().unwrap().push(parts.join("\t"));
+        // Print captures: poison-recover so a prior panic doesn't
+        // wedge subsequent evals.
+        match cap_for_fn.lock() {
+            Ok(mut g) => g.push(parts.join("\t")),
+            Err(p) => p.into_inner().push(parts.join("\t")),
+        }
         Ok(())
     }) {
         Ok(f) => f,
@@ -189,7 +223,10 @@ fn eval_in(lua: &Lua, source: &str) -> EvalResult {
         let _ = lua.globals().set("print", p);
     }
 
-    let stdout = captured.lock().unwrap().join("\n");
+    let stdout = match captured.lock() {
+        Ok(g) => g.join("\n"),
+        Err(p) => p.into_inner().join("\n"),
+    };
     match outcome {
         Ok(rv) => EvalResult {
             stdout,

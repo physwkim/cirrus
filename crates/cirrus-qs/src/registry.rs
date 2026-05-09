@@ -182,7 +182,10 @@ impl Registry {
         None
     }
 
-    /// All device names (union over all role registrations).
+    /// All device names (union over all role registrations + lua-only
+    /// devices). A device registered solely via
+    /// `register_lua_methods` (no readable/movable/...) still appears
+    /// here so the daemon Lua state publishes it as a global.
     pub fn device_names(&self) -> Vec<String> {
         let mut s = std::collections::BTreeSet::new();
         for k in self.readables.keys() {
@@ -201,6 +204,9 @@ impl Registry {
             s.insert(k.clone());
         }
         for k in self.collectables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.lua_exposed.keys() {
             s.insert(k.clone());
         }
         s.into_iter().collect()
