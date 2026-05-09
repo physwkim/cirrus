@@ -246,6 +246,23 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
     let self_ty = &input.self_ty;
 
+    // Generic impl blocks (`impl<T> Foo<T> { ... }`) would need a
+    // distinct `&'static [LuaMethodEntry]` per monomorphization, but
+    // statics can't capture generic parameters. Reject up front with
+    // a clear message instead of emitting code that fails to compile
+    // with cryptic errors. Future work: support via OnceLock-backed
+    // per-T tables.
+    if !input.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input.generics,
+            "#[lua_methods] does not support generic impl blocks; \
+             concrete `impl Type` only. Wrap generic devices in a \
+             concrete newtype, or expose individual instances.",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let mut entries: Vec<TokenStream2> = Vec::new();
 
     for it in &input.items {

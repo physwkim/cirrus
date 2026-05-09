@@ -19,6 +19,22 @@
 //! with a clear message. Once built, the Lua state persists for the
 //! lifetime of the daemon process — globals set by previous evals
 //! survive across calls.
+//!
+//! ## Aborting in-flight evals
+//!
+//! - **Plans** (`RE:run(...)` from Lua): use the `re_abort` JSON-RPC.
+//!   Goes through `cirrus qs re abort` from another terminal. The
+//!   engine's abort flag propagates through the `cirrus_runtime`
+//!   `block_on` inside Lua at the next checkpoint; the lua_eval task
+//!   then transitions to `completed` with `exit_status` other than
+//!   `success`. Verified by
+//!   `re_abort_cancels_in_flight_lua_eval_plan` in
+//!   `cirrus-cli/tests/cli_round_trip.rs`.
+//! - **Pure Lua loops** (`while true do ... end` with no Msg yields):
+//!   not abortable from the daemon side. The blocking thread is
+//!   stuck in mlua. Restart the daemon to recover. Future work could
+//!   wire `mlua::HookTriggers` against an atomic abort flag, but that
+//!   adds latency to every Lua instruction and is deferred.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -291,16 +307,21 @@ fn make_method_proxy(lua: &Lua, dev: LuaDevice, entry: &LuaExposedEntry) -> mlua
 
     // Metatable: missing keys delegate to the userdata, with self
     // re-bound to the userdata so existing add_method handlers see
-    // the correct receiver.
+    // the correct receiver. Wrappers are cached on the proxy table
+    // (via raw_set) so a hot loop like `for i=1,1e6 do dx:read() end`
+    // doesn't allocate a fresh closure per iteration.
     let meta = lua.create_table()?;
     let dev_ud_for_meta = dev_ud.clone();
-    let __index = lua.create_function(move |lua, (_t, key): (Table, mlua::String)| {
+    let __index = lua.create_function(move |lua, (proxy, key): (Table, mlua::String)| {
         let key_str = key.to_str()?.to_string();
+        // Cache hit: a previous lookup already stored a wrapper.
+        let cached: mlua::Value = proxy.raw_get(&*key_str)?;
+        if !matches!(cached, mlua::Value::Nil) {
+            return Ok(cached);
+        }
+        // Cache miss: look up on the userdata.
         let val: mlua::Value = dev_ud_for_meta.get(&*key_str).unwrap_or(mlua::Value::Nil);
         if let mlua::Value::Function(f) = val {
-            // Re-bind self: when called as `proxy:method(args)`, Lua
-            // passes the proxy table as the first arg, but `f` was
-            // built expecting the userdata. Wrap to substitute.
             let dev_for_call = dev_ud_for_meta.clone();
             let wrapped = lua.create_function(
                 move |_lua, args: Variadic<mlua::Value>| -> mlua::Result<Variadic<mlua::Value>> {
@@ -312,6 +333,10 @@ fn make_method_proxy(lua: &Lua, dev: LuaDevice, entry: &LuaExposedEntry) -> mlua
                     f.call::<Variadic<mlua::Value>>(Variadic::from_iter(new_args))
                 },
             )?;
+            // Memoize on the proxy table so subsequent lookups hit
+            // direct table indexing (no __index call). raw_set
+            // bypasses __newindex.
+            proxy.raw_set(&*key_str, wrapped.clone())?;
             Ok(mlua::Value::Function(wrapped))
         } else {
             Ok(val)

@@ -273,3 +273,77 @@ fn lua_eval_runs_count_plan_through_daemon() {
     }
     assert!(got_completed, "RE:run(count) did not complete in 5s");
 }
+
+#[test]
+fn re_abort_cancels_in_flight_lua_eval_plan() {
+    // R5.2: a long-running plan started via lua_eval (RE:run inside
+    // Lua) must be cancellable via the standard re_abort RPC. The
+    // qs-server's REP loop is free during lua_eval (returns task_uid
+    // immediately), so a parallel re_abort reaches dispatch and the
+    // engine's abort flag propagates through cirrus_runtime's
+    // block_on inside Lua.
+    //
+    // This guards against future regressions where lua_eval might
+    // accidentally hold the REP loop or where the engine no longer
+    // honors abort from outside the queue worker.
+    let m = spawn_manager();
+    let (_, _, c) = run_client(&m.control, &["environment", "open"]);
+    assert_eq!(c, 0);
+
+    // 5-second plan via Lua coroutine: 10 sleeps of 500 ms each.
+    let lua = r#"
+local function long_sleeper(n, secs)
+    for i = 1, n do
+        coroutine.yield(msg.sleep(secs))
+    end
+end
+return tostring(RE:run(plan(long_sleeper, 10, 0.5)))
+"#;
+    let params = format!(r#"{{"source":{}}}"#, serde_json::json!(lua));
+    let (out, _err, code) = run_client(&m.control, &["raw", "lua_eval", &params]);
+    assert_eq!(code, 0);
+    let task_uid = out
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix(r#""task_uid": ""#)
+                .and_then(|s| s.strip_suffix(r#"""#))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no task_uid in: {out}"));
+
+    // Wait briefly so the plan starts, then abort.
+    sleep(Duration::from_millis(400));
+    let (_, _, c) = run_client(&m.control, &["re", "abort"]);
+    assert_eq!(c, 0, "re abort RPC should succeed while plan is in-flight");
+
+    // Plan should resolve well before the 5-second nominal duration.
+    // The engine surfaces aborted runs with `exit_status=fail` or
+    // `exit_status=abort` (depending on whether OpenRun completed
+    // before the abort fired); we assert the abort cut the run short
+    // by requiring completion within 3 s and exit_status != success.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut got_completed = false;
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(100));
+        let p = format!(r#"{{"task_uid":"{task_uid}"}}"#);
+        let (out2, _, c2) = run_client(&m.control, &["raw", "task_result", &p]);
+        assert_eq!(c2, 0);
+        if out2.contains(r#""status": "completed""#) {
+            assert!(
+                !out2.contains("exit_status=success"),
+                "abort should NOT yield exit_status=success: {out2}"
+            );
+            assert!(
+                out2.contains("exit_status=abort") || out2.contains("exit_status=fail"),
+                "expected exit_status=abort|fail after re abort, got {out2}"
+            );
+            got_completed = true;
+            break;
+        }
+    }
+    assert!(
+        got_completed,
+        "lua_eval task did not honor re_abort within 3s — plan would have taken 5s otherwise"
+    );
+}
