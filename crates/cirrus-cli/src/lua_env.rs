@@ -217,10 +217,7 @@ impl UserData for LuaDevice {
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(mv.set_dyn(v));
-            Ok(LuaStatus {
-                inner: TMutex::new(Some(status)),
-                label: format!("set({}={v})", dev.name),
-            })
+            Ok(LuaStatus::new(status, format!("set({}={v})", dev.name)))
         });
         // motor:move_to(v)  ->  nil  (set + wait for completion)
         methods.add_method("move_to", |_, dev, v: f64| {
@@ -242,10 +239,7 @@ impl UserData for LuaDevice {
                 mlua::Error::RuntimeError(format!("{} is not triggerable", dev.name))
             })?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(t.trigger_dyn());
-            Ok(LuaStatus {
-                inner: TMutex::new(Some(status)),
-                label: format!("trigger({})", dev.name),
-            })
+            Ok(LuaStatus::new(status, format!("trigger({})", dev.name)))
         });
         // motor:stop()      ->  nil
         methods.add_method("stop", |_, dev, ()| {
@@ -293,10 +287,7 @@ impl UserData for LuaDevice {
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(f.kickoff_dyn());
-            Ok(LuaStatus {
-                inner: TMutex::new(Some(status)),
-                label: format!("kickoff({})", dev.name),
-            })
+            Ok(LuaStatus::new(status, format!("kickoff({})", dev.name)))
         });
         methods.add_method("complete", |_, dev, ()| {
             let f = dev
@@ -304,10 +295,7 @@ impl UserData for LuaDevice {
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(f.complete_dyn());
-            Ok(LuaStatus {
-                inner: TMutex::new(Some(status)),
-                label: format!("complete({})", dev.name),
-            })
+            Ok(LuaStatus::new(status, format!("complete({})", dev.name)))
         });
         // pause_count / resume_count — only meaningful for
         // soft_pausable test devices. Reads are routed through the
@@ -339,33 +327,77 @@ static PAUSE_COUNTERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<LuaPausableCounter>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Lua-side `Status` handle. Wraps a single-use `cirrus_core::Status` so
-/// users can `s:wait()` to block on completion. Returned by
-/// `motor:set(v)`, `det:trigger()`, `flyer:kickoff()`, `flyer:complete()`.
+/// Lua-side `Status` handle. Wraps a `cirrus_core::Status` (which is
+/// itself `Clone`, sharing the underlying state via `Arc`). Returned
+/// by `motor:set(v)`, `det:trigger()`, `flyer:kickoff()`, `flyer:complete()`.
+///
+/// All inspection methods are sync and non-consuming:
+/// - `:done()` — has the operation completed?
+/// - `:success()` — `nil` while pending, `true`/`false` once done
+/// - `:exception()` — error string if failed, else `nil`
+/// - `:progress()` — current progress fraction (0.0–1.0)
+/// - `:inspect()` — table with all of the above
+/// - `:wait()` — block until completion (raises on failure)
 pub struct LuaStatus {
-    inner: TMutex<Option<cirrus_core::status::Status>>,
+    inner: cirrus_core::status::Status,
     label: String,
+}
+
+impl LuaStatus {
+    /// Build from a `Status`.
+    pub fn new(status: cirrus_core::status::Status, label: String) -> Self {
+        Self {
+            inner: status,
+            label,
+        }
+    }
 }
 
 impl UserData for LuaStatus {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method("__tostring", |_, s, ()| Ok(format!("Status({})", s.label)));
+        methods.add_meta_method("__tostring", |_, s, ()| {
+            let snap = s.inner.inspect();
+            Ok(format!(
+                "Status({}, done={}, success={})",
+                s.label, snap["done"], snap["success"]
+            ))
+        });
         // s:wait() — block until the operation completes. Returns nil on
-        // success; raises a Lua error on failure.
+        // success; raises a Lua error on failure. Idempotent — if the
+        // operation has already completed, returns immediately.
         methods.add_method("wait", |_, s, ()| {
-            let st = s
-                .inner
-                .blocking_lock()
-                .take()
-                .ok_or_else(|| mlua::Error::RuntimeError("Status already awaited".into()))?;
+            let st = s.inner.clone();
             cirrus_core::runtime::cirrus_runtime()
                 .block_on(st)
                 .map_err(|e| mlua::Error::RuntimeError(format!("status: {e:?}")))?;
             Ok(())
         });
-        // s:done() — non-blocking: true if no longer pending. Currently
-        // Status is single-use; once `wait` consumes it, done()=true.
-        methods.add_method("done", |_, s, ()| Ok(s.inner.blocking_lock().is_none()));
+        // s:done() — non-blocking: has the operation completed?
+        methods.add_method("done", |_, s, ()| Ok(s.inner.done_state()));
+        // s:success() — nil while pending; true/false once done.
+        methods.add_method("success", |_, s, ()| {
+            if s.inner.done_state() {
+                Ok(Some(s.inner.success()))
+            } else {
+                Ok(None)
+            }
+        });
+        // s:exception() — failure message string, or nil.
+        methods.add_method("exception", |_, s, ()| {
+            Ok(s.inner.exception().map(|e| e.to_string()))
+        });
+        // s:progress() — current progress fraction.
+        methods.add_method("progress", |_, s, ()| Ok(s.inner.progress()));
+        // s:inspect() — table {done, success, exception, progress, label}
+        methods.add_method("inspect", |lua, s, ()| {
+            let v = s.inner.inspect();
+            let t = match json_to_lua(lua, &v) {
+                LuaValue::Table(t) => t,
+                _ => lua.create_table()?,
+            };
+            t.set("label", s.label.clone())?;
+            Ok(t)
+        });
     }
 }
 

@@ -111,6 +111,38 @@ impl Status {
         }
     }
 
+    /// Current progress fraction (0.0–1.0). The `Future` impl does
+    /// not surface this — it's exposed for inspect/debug paths.
+    pub fn progress(&self) -> f64 {
+        *self.progress_rx.borrow()
+    }
+
+    /// Snapshot the status as a JSON value suitable for inspect /
+    /// debug output. Shape:
+    ///
+    /// ```json
+    /// { "done": bool, "success": bool|null,
+    ///   "exception": "...string..."|null, "progress": 0.0–1.0 }
+    /// ```
+    ///
+    /// `success` is `null` while pending; once `done`, it's a bool.
+    pub fn inspect(&self) -> serde_json::Value {
+        let state = self.inner.state.load(Ordering::Acquire);
+        let done = state != PENDING;
+        let success = match state {
+            SUCCESS => Some(true),
+            ERROR => Some(false),
+            _ => None,
+        };
+        let exception = self.exception().map(|e| e.to_string());
+        serde_json::json!({
+            "done": done,
+            "success": success,
+            "exception": exception,
+            "progress": self.progress(),
+        })
+    }
+
     /// ophyd-style: register a callback fired on completion. If already done,
     /// fires immediately on the calling thread.
     pub fn add_callback<F>(&self, cb: F)
@@ -266,6 +298,32 @@ mod tests {
         let h = tokio::spawn(s);
         setter.success();
         assert!(h.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn inspect_pending_success_failure() {
+        // Pending shape.
+        let (s, setter) = Status::new();
+        let v = s.inspect();
+        assert_eq!(v["done"], false);
+        assert!(v["success"].is_null());
+        assert!(v["exception"].is_null());
+        assert_eq!(v["progress"], 0.0);
+
+        // Successful resolution.
+        setter.success();
+        let v = s.inspect();
+        assert_eq!(v["done"], true);
+        assert_eq!(v["success"], true);
+        assert!(v["exception"].is_null());
+
+        // Failed resolution.
+        let (s2, setter2) = Status::new();
+        setter2.fail(StatusError::Failed("boom".into()));
+        let v = s2.inspect();
+        assert_eq!(v["done"], true);
+        assert_eq!(v["success"], false);
+        assert_eq!(v["exception"].as_str(), Some("boom"));
     }
 
     #[tokio::test]

@@ -1251,6 +1251,41 @@ print("ok")
 }
 
 #[test]
+fn status_inspect_done_success_exception() {
+    // SoftMotor.set returns a Status that resolves immediately to
+    // success. Status methods should reflect that and survive
+    // multiple calls (idempotent).
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local s = m1:set(1.5)
+
+-- Wait so the (already-done) status definitely settles, then
+-- assert all introspection methods.
+s:wait()
+
+assert(s:done() == true, "done should be true after wait")
+assert(s:success() == true, "success should be true, got " .. tostring(s:success()))
+assert(s:exception() == nil, "no exception expected, got " .. tostring(s:exception()))
+assert(type(s:progress()) == "number")
+
+local snap = s:inspect()
+assert(snap.done == true, "snap.done should be true")
+assert(snap.success == true, "snap.success should be true")
+assert(snap.exception == nil)
+assert(type(snap.progress) == "number")
+assert(snap.label == "set(m1=1.5)", "label = " .. tostring(snap.label))
+
+-- Calling wait again must still succeed (idempotent).
+s:wait()
+print("status.inspect ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}\nstdout: {out}");
+    assert!(out.contains("status.inspect ok"), "out = {out}");
+}
+
+#[test]
 fn inspect_dumps_soft_motor_state() {
     let (out, err, code) = run_script(
         r#"
