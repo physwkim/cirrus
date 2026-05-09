@@ -59,24 +59,27 @@ bottom for reference.
   format design + integration with `RunEngine::run_async`.
 
 ### 3.2 Prometheus metrics + health probes
-- **Status**: tracing spans + atomic overflow counters; no metrics
-  endpoint.
-- **Plan**: `metrics-rs` or `prometheus` crate, expose
-  `/metrics` from cirrus-qs and standalone REPL. ~1-2 days.
+- **Status**: SHIPPED (`54e0bc8`). `cirrus-qs/metrics` feature exposes
+  `/metrics` HTTP endpoint via `metrics-exporter-prometheus`.
+  `cirrus_qs_rpc_calls_total{method=...}` instrumented in dispatch.
+- **Remaining**: wire queue_depth gauge, run_finished counter, and
+  per-document counters at their natural call sites.
 
 ### 3.3 Soak / stress tests + criterion benches
-- **Status**: out-of-band track in doc 07; nothing built.
-- **Plan**: `benches/` directory + a `cargo bench` job in CI;
-  long-running soak that drives 10k+ scans / detector frames and
-  asserts no leak / no slowdown. ~1 week.
+- **Status**: criterion benches SHIPPED (`92bc602`) — `plan_loop`
+  measures count(N) for N ∈ {1, 10, 100, 1000} (~2µs/Msg) and
+  `document_fanout` measures 10-point count with {0,1,4,16,64} subs.
+- **Remaining**: long-running soak harness driving 10k+ scans /
+  detector frames asserting no leak / no slowdown. ~1 week.
 
 ## Tier 4 — UX / docs residue
 
 ### 4.1 User manual / migration guide / cookbook
-- **Status**: doc/00-09 are architecture notes; no narrative user
-  manual.
-- **Plan**: `mdbook` site under `book/`; cookbook of common plan
-  patterns; bluesky → cirrus migration walkthrough. ~1-2 weeks.
+- **Status**: SHIPPED (`1800420`). `book/` mdbook source with
+  introduction / quickstart / migration / cli / features /
+  operations / architecture chapters.
+- **Remaining**: cookbook chapter of common plan patterns + recipes;
+  GitHub Pages CI publish step.
 
 ### 4.2 Live plot / BestEffortCallback equivalent
 - **Status**: none.
@@ -92,10 +95,12 @@ bottom for reference.
   scope.
 
 ### 4.4 cirrus-cli REPL UX (autocompletion etc.)
-- **Status**: rustyline default behavior.
-- **Plan**: register a custom completer that knows device names
-  pre-loaded into the Lua state; persistent history file. ~2-3
-  days.
+- **Status**: SHIPPED (`a6ed9b9`). `CirrusReplHelper` registers a
+  custom rustyline completer with curated keyword list (RE:*, msg.*,
+  bp.*, bps.*, bpt.*, bpp.*, tiled.*); persistent history at
+  `~/.cirrus_repl_history`.
+- **Remaining**: completion of device names introspected from the
+  live Lua state (vs. the static keyword list).
 
 ## Tier 5 — security residue
 
@@ -136,4 +141,10 @@ bottom for reference.
   task_result, manager_test, permissions_get, manager_version
   (`819bf6e`)
 - D21 scaffolding: `ZmqDocumentSource` (SUB side) +
-  `cirrus frame-source` subcommand
+  `cirrus frame-source` subcommand (`dac7c56`)
+- REPL Tab completion + persistent history (`a6ed9b9`)
+- criterion benches: `plan_loop` + `document_fanout` (`92bc602`)
+- Prometheus `/metrics` endpoint behind `metrics` feature
+  (`54e0bc8`)
+- mdbook user manual: introduction / quickstart / migration / cli /
+  features / operations / architecture (`1800420`)
