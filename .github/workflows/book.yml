@@ -1,5 +1,17 @@
 name: book
 
+# Builds the mdbook on every push that touches `book/**` and uploads
+# the rendered HTML as a downloadable artifact. The optional
+# `deploy` job publishes to GitHub Pages — but **only if Pages is
+# already enabled on the repo with "GitHub Actions" as the source**.
+# A workflow's default GITHUB_TOKEN lacks the admin permission
+# needed to auto-enable Pages, so the one-time setup is manual:
+#
+#   Repo Settings → Pages → Source: "GitHub Actions"
+#
+# Until that's configured, the build job still runs and produces a
+# downloadable HTML artifact; the deploy job is skipped.
+
 on:
   push:
     branches: [main]
@@ -20,6 +32,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.configure.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,21 +47,31 @@ jobs:
       - name: Build the book
         run: mdbook build book/
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
+      # Always upload as a generic artifact so contributors can grab
+      # the rendered HTML even before Pages is enabled.
+      - name: Upload generic artifact
+        uses: actions/upload-artifact@v4
         with:
-          # Auto-enable Pages on the repo on first run so the workflow
-          # doesn't 404 against the Pages REST endpoint. Once enabled,
-          # this is a no-op on subsequent runs.
-          enablement: true
+          name: book-html
+          path: ./book/book
 
-      - name: Upload artifact
+      # Probe whether Pages is enabled on the repo. continue-on-error
+      # so the workflow doesn't fail when an admin hasn't toggled
+      # Source = "GitHub Actions" yet.
+      - name: Configure Pages
+        id: configure
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: steps.configure.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./book/book
 
   deploy:
     needs: build
+    if: needs.build.outputs.pages_enabled == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
