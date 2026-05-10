@@ -13,6 +13,7 @@
 
 #![deny(missing_docs)]
 
+mod checkpoint_store;
 mod client;
 mod doctor;
 mod frame_source;

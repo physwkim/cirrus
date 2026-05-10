@@ -9,9 +9,9 @@ pub mod suspender;
 
 pub use bundler::RunBundler;
 pub use engine::{
-    CustomCommandHandler, DocumentCallback, EngineRunState, InputHandler, MdNormalizer,
-    MdValidator, MsgResult, PlanHook, Preprocessor, RunEngine, RunOptions, RunResult, ScanIdSource,
-    SubscriptionId, SuspendCallback,
+    CheckpointHook, CheckpointSnapshot, CustomCommandHandler, DocumentCallback, EngineRunState,
+    InputHandler, MdNormalizer, MdValidator, MsgResult, PlanHook, Preprocessor, RunEngine,
+    RunOptions, RunResult, ScanIdSource, SubscriptionId, SuspendCallback,
 };
 pub use sink::{BroadcastSink, DocumentSink};
 pub use suspender::{

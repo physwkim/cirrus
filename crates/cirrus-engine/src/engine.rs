@@ -97,6 +97,25 @@ pub type Preprocessor = Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static>;
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Snapshot delivered to a [`CheckpointHook`] on every `Msg::Checkpoint`.
+/// Lets callers persist enough state to know "the engine reached a
+/// safe point at time T inside run R" without coupling to the
+/// engine's internal types.
+#[derive(Clone, Debug)]
+pub struct CheckpointSnapshot {
+    /// Wall-clock UTC nanoseconds since the unix epoch.
+    pub timestamp_ns: u64,
+    /// `RunStart.uid` of the currently open run, or `None` if no run
+    /// is open (between runs).
+    pub run_uid: Option<String>,
+}
+
+/// Hook invoked synchronously on every `Msg::Checkpoint`. Implementations
+/// must be quick — the engine awaits the call. Use it to persist
+/// crash-recovery info (write a JSONL line to disk, ping a watchdog,
+/// etc.); for heavier work spawn a tokio task and return immediately.
+pub type CheckpointHook = Arc<dyn Fn(CheckpointSnapshot) + Send + Sync + 'static>;
+
 /// Handler used by [`RunEngine`] to satisfy `Msg::Input`. Receives the
 /// prompt and returns the user's response. Mirrors bluesky's
 /// `_input` which routes through `AsyncInput`.
@@ -266,6 +285,11 @@ pub struct RunEngine {
     /// declared on `OpenRun` (only when the flag is on at that
     /// moment). Off by default.
     record_interruptions: AtomicBool,
+    /// Optional callback fired on every `Msg::Checkpoint`. Used for
+    /// crash-recovery persistence — the daemon installs a hook that
+    /// appends a JSONL line so a post-restart audit can answer
+    /// "where was the engine at last shutdown?".
+    checkpoint_hook: StdMutex<Option<CheckpointHook>>,
 }
 
 #[derive(Default)]
@@ -346,7 +370,15 @@ impl RunEngine {
             last_msg_result: StdMutex::new(MsgResult::None),
             signal_installed: AtomicBool::new(false),
             record_interruptions: AtomicBool::new(false),
+            checkpoint_hook: StdMutex::new(None),
         }
+    }
+
+    /// Install a callback fired on every `Msg::Checkpoint`. The hook
+    /// is synchronous — keep it light. Subsequent calls overwrite.
+    /// Pass `None`-equivalent (an empty closure) to disable.
+    pub fn set_checkpoint_hook(&self, hook: CheckpointHook) {
+        *self.checkpoint_hook.lock().unwrap() = Some(hook);
     }
 
     /// Toggle interruption recording. When enabled, every subsequent
@@ -1195,7 +1227,22 @@ impl RunEngine {
                 // Clear cache up to this point — the rewindable region restarts.
                 state.msg_cache.clear();
                 state.rewindable = true;
+                let run_uid = state.bundler.as_ref().map(|b| b.start_uid.clone());
                 drop(state);
+                // Crash-recovery hook: persist the snapshot so post-
+                // restart auditing can pinpoint where the engine
+                // left off. Fired *after* msg_cache is cleared so
+                // the cleared state is the durable one.
+                if let Some(hook) = self.checkpoint_hook.lock().unwrap().clone() {
+                    let snap = CheckpointSnapshot {
+                        timestamp_ns: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or_default(),
+                        run_uid,
+                    };
+                    hook(snap);
+                }
                 // If a deferred_pause is queued, apply it now.
                 if self.deferred_pause.swap(false, Ordering::SeqCst) {
                     self.is_paused.store(true, Ordering::SeqCst);

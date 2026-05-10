@@ -8,6 +8,7 @@ use cirrus_qs::{Registry, Server};
 use clap::Args;
 use tokio::sync::Mutex as TMutex;
 
+use crate::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
 use crate::manager_lua::ManagerLuaState;
 
 /// Arguments for `cirrus qs-manager`.
@@ -47,6 +48,15 @@ pub struct ManagerArgs {
     /// Callers identify themselves by `params.api_key`.
     #[arg(long)]
     permissions: Option<std::path::PathBuf>,
+
+    /// Optional path to the checkpoint JSONL file. Each
+    /// `Msg::Checkpoint` the engine emits is appended as one record
+    /// (timestamp + run_uid + cirrus version). On startup, if the
+    /// file already exists, the latest record is logged so an
+    /// operator can answer "where was the engine when the daemon
+    /// went down?". Default: `~/.cirrus/checkpoints.jsonl`.
+    #[arg(long)]
+    checkpoints: Option<std::path::PathBuf>,
 }
 
 /// Entry point — returns a process exit code.
@@ -81,12 +91,35 @@ pub async fn run(args: ManagerArgs) -> i32 {
     let evaluator: Arc<dyn cirrus_qs::LuaEvaluator> =
         Arc::new(ManagerLuaState::new(engine_slot.clone(), registry_for_lua));
 
+    // Crash-recovery audit trail. On startup, log the most recent
+    // record (if any) so the operator can pinpoint where the engine
+    // left off; install the JSONL hook on the engine the moment
+    // `environment_open` populates the slot.
+    let ckpt_path = args.checkpoints.clone().unwrap_or_else(default_ckpt_path);
+    if let Some(prev) = JsonlCheckpointStore::latest(&ckpt_path) {
+        tracing::info!(
+            target: "cirrus-qs",
+            "checkpoint store: previous record at ts={} run={:?} from {}",
+            prev.timestamp_ns,
+            prev.run_uid,
+            prev.cirrus_version,
+        );
+    }
+    let ckpt_store = Arc::new(JsonlCheckpointStore::new(ckpt_path.clone()));
+    let ckpt_hook = ckpt_store.clone().into_hook();
+    tracing::info!(
+        target: "cirrus-qs",
+        "checkpoint hook will append to {} on environment_open",
+        ckpt_path.display(),
+    );
+
     let mut sb = Server::builder()
         .control_address(&args.control)
         .document_address(&args.documents)
         .registry(reg)
         .engine_slot(engine_slot)
-        .lua_evaluator(evaluator);
+        .lua_evaluator(evaluator)
+        .checkpoint_hook(ckpt_hook);
     if let Some(addr) = &args.metrics {
         sb = sb.metrics_address(addr);
     }

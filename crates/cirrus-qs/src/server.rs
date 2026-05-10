@@ -18,6 +18,7 @@ use crate::registry::Registry;
 use crate::state::{EState, EngineState};
 use crate::tasks::TaskTracker;
 use crate::transport::ReqRepSocket;
+use cirrus_engine::CheckpointHook;
 
 /// Server builder. Construct and `build()` to commit (rule **K9** — no
 /// background tasks until `run_async` / `run_blocking`).
@@ -41,6 +42,12 @@ pub struct ServerBuilder {
     /// resolve `RE` lazily; supplying it here avoids constructing
     /// two slots that fight over the same engine identity.
     engine_slot: Option<Arc<Mutex<Option<Arc<RunEngine>>>>>,
+    /// Optional `CheckpointHook` installed on the engine the moment
+    /// `environment_open` creates it. Avoids the "watcher race"
+    /// where a polling task tries to install a hook after the engine
+    /// is born — a fast plan can run to completion before the
+    /// watcher catches up.
+    checkpoint_hook: Option<CheckpointHook>,
 }
 
 impl Default for ServerBuilder {
@@ -53,6 +60,7 @@ impl Default for ServerBuilder {
             permissions_path: None,
             lua_evaluator: None,
             engine_slot: None,
+            checkpoint_hook: None,
         }
     }
 }
@@ -103,6 +111,14 @@ impl ServerBuilder {
     /// engine. If unset, the server builds a fresh empty slot.
     pub fn engine_slot(mut self, slot: Arc<Mutex<Option<Arc<RunEngine>>>>) -> Self {
         self.engine_slot = Some(slot);
+        self
+    }
+    /// Install a `CheckpointHook` on the engine the moment
+    /// `environment_open` creates it. The hook is invoked
+    /// synchronously on every `Msg::Checkpoint`; it must be quick.
+    /// Used by the daemon's crash-recovery JSONL store.
+    pub fn checkpoint_hook(mut self, hook: CheckpointHook) -> Self {
+        self.checkpoint_hook = Some(hook);
         self
     }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
@@ -160,6 +176,7 @@ impl ServerBuilder {
             permissions,
             lua_evaluator: self.lua_evaluator,
             task_tracker: Arc::new(TaskTracker::new()),
+            checkpoint_hook: self.checkpoint_hook,
         })
     }
 }
@@ -179,6 +196,7 @@ pub struct Server {
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
+    checkpoint_hook: Option<CheckpointHook>,
 }
 
 impl Server {
@@ -201,6 +219,7 @@ impl Server {
         let permissions = self.permissions.clone();
         let lua_evaluator = self.lua_evaluator.clone();
         let task_tracker = self.task_tracker.clone();
+        let checkpoint_hook = self.checkpoint_hook.clone();
 
         let join = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -216,6 +235,7 @@ impl Server {
                 permissions,
                 lua_evaluator,
                 task_tracker,
+                checkpoint_hook,
             )
         });
         join.await
@@ -281,6 +301,7 @@ fn rep_loop(
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
+    checkpoint_hook: Option<CheckpointHook>,
 ) -> Result<()> {
     while !socket.is_shutdown() {
         let req = match socket.try_recv() {
@@ -300,6 +321,7 @@ fn rep_loop(
             permissions.clone(),
             lua_evaluator.clone(),
             task_tracker.clone(),
+            checkpoint_hook.clone(),
         );
         if let Err(e) = socket.send(&resp) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");

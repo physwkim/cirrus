@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use cirrus_engine::{DocumentSink, RunEngine};
+use cirrus_engine::{CheckpointHook, DocumentSink, RunEngine};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
@@ -39,6 +39,7 @@ pub(crate) fn dispatch(
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
+    checkpoint_hook: Option<CheckpointHook>,
 ) -> RpcResponse {
     let id = req.id.clone();
     let m = req.method.as_str();
@@ -144,7 +145,14 @@ pub(crate) fn dispatch(
         }
 
         // -- environment --------------------------------------------------
-        "environment_open" => env_open(id, document_sink, &state, &engine, rt),
+        "environment_open" => env_open(
+            id,
+            document_sink,
+            &state,
+            &engine,
+            rt,
+            checkpoint_hook.as_ref(),
+        ),
         "environment_close" => env_close(id, &state, &engine, rt),
         "environment_destroy" => env_close(id, &state, &engine, rt), // forced close
         "environment_update" => RpcResponse::ok(id, json!({"success": true, "msg": ""})),
@@ -599,13 +607,18 @@ fn env_open(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
+    checkpoint_hook: Option<&CheckpointHook>,
 ) -> RpcResponse {
     let mut e = rt.block_on(engine.lock());
     if e.is_some() {
         return RpcResponse::err(id, codes::QSERVER, "environment already open");
     }
     let sinks: Vec<Arc<dyn DocumentSink>> = document_sink.iter().cloned().collect();
-    *e = Some(Arc::new(RunEngine::new(sinks)));
+    let re = Arc::new(RunEngine::new(sinks));
+    if let Some(hook) = checkpoint_hook {
+        re.set_checkpoint_hook(hook.clone());
+    }
+    *e = Some(re);
     state.lock().unwrap().state = Some(EState::Idle);
     RpcResponse::ok(id, json!({"success": true, "msg": ""}))
 }

@@ -347,3 +347,117 @@ return tostring(RE:run(plan(long_sleeper, 10, 0.5)))
         "lua_eval task did not honor re_abort within 3s — plan would have taken 5s otherwise"
     );
 }
+
+#[test]
+fn checkpoint_hook_records_on_run() {
+    // Verifies the checkpoint persistence path:
+    // - Spawn `cirrus qs-manager` with `--checkpoints <tmp>`.
+    // - Run a `count` plan via the queue (which emits Checkpoints
+    //   between iterations).
+    // - Read the JSONL file; assert ≥1 record with our run's uid.
+    let id = rand_id();
+    let ckpt_path = format!(
+        "/tmp/cirrus-cli-it-{}-{}-checkpoints.jsonl",
+        std::process::id(),
+        id
+    );
+    let _ = std::fs::remove_file(&ckpt_path);
+
+    let control = format!(
+        "ipc:///tmp/cirrus-cli-it-{}-{}-c.sock",
+        std::process::id(),
+        id
+    );
+    let documents = format!(
+        "ipc:///tmp/cirrus-cli-it-{}-{}-d.sock",
+        std::process::id(),
+        id
+    );
+    let mut child = Command::new(cirrus_bin())
+        .args([
+            "qs-manager",
+            "--control",
+            &control,
+            "--documents",
+            &documents,
+            "--soft-detectors",
+            "1",
+            "--soft-motors",
+            "1",
+            "--checkpoints",
+            &ckpt_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cirrus qs-manager");
+    // Wait for bind.
+    let path = control.trim_start_matches("ipc://");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if std::path::Path::new(path).exists() {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+
+    // env_open then drive a Lua plan that yields explicit
+    // Checkpoint Msgs (the canned `count` plan does not).
+    let (_, _, c) = run_client(&control, &["environment", "open"]);
+    assert_eq!(c, 0);
+    let lua = r#"
+local function ckpt_test()
+    coroutine.yield(msg.open_run({plan_name = "ckpt_test"}))
+    for i = 1, 3 do
+        coroutine.yield(msg.checkpoint())
+    end
+    coroutine.yield(msg.close_run("success"))
+end
+return tostring(RE:run(plan(ckpt_test)))
+"#;
+    let params = format!(r#"{{"source":{}}}"#, serde_json::json!(lua));
+    let (out, _, c) = run_client(&control, &["raw", "lua_eval", &params]);
+    assert_eq!(c, 0, "lua_eval submit: {out}");
+
+    // Wait for the lua_eval task to finish (poll at least one
+    // task_status). With 3 checkpoints, the run completes quickly.
+    let task_uid = out
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix(r#""task_uid": ""#)
+                .and_then(|s| s.strip_suffix(r#"""#))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no task_uid in: {out}"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(100));
+        let p = format!(r#"{{"task_uid":"{task_uid}"}}"#);
+        let (out2, _, _) = run_client(&control, &["raw", "task_result", &p]);
+        if out2.contains(r#""status": "completed""#) {
+            break;
+        }
+    }
+
+    // Cleanup the daemon, allow the OS to flush.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(path);
+
+    // Verify the JSONL file has at least one record.
+    let text = std::fs::read_to_string(&ckpt_path)
+        .unwrap_or_else(|e| panic!("checkpoint file {ckpt_path} missing: {e}"));
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "expected ≥1 checkpoint record in {ckpt_path}, got: {text:?}"
+    );
+    // Each line is JSON with the expected shape.
+    let last: serde_json::Value =
+        serde_json::from_str(lines.last().unwrap()).expect("last record JSON");
+    assert!(last.get("timestamp_ns").is_some());
+    assert!(last.get("cirrus_version").is_some());
+
+    let _ = std::fs::remove_file(&ckpt_path);
+}

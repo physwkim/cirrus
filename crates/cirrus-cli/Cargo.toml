@@ -14,6 +14,7 @@ rustyline.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 zmq.workspace = true
@@ -50,6 +51,7 @@ frame-source = [
 
 [dev-dependencies]
 cirrus-derive.workspace = true
+tempfile = "3"
 
 [[bin]]
 name = "cirrus"
