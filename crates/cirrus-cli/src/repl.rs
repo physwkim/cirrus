@@ -227,6 +227,14 @@ pub struct ReplArgs {
     /// after the script finishes.
     #[arg(long, value_name = "FILE")]
     pub script: Option<PathBuf>,
+
+    /// Optional ZMQ PUB endpoint. When set, every Document the
+    /// engine emits is published to this address using bluesky's
+    /// `Publisher` envelope (msgpack body). Connect a Python
+    /// `bluesky.callbacks.zmq.RemoteDispatcher` on the receiving
+    /// side to consume them. Example: `--doc-zmq tcp://*:5577`.
+    #[arg(long, value_name = "ADDR")]
+    pub doc_zmq: Option<String>,
 }
 
 /// Entry point — returns process exit code.
@@ -240,7 +248,24 @@ pub fn run(args: ReplArgs) -> i32 {
     #[cfg(feature = "ca")]
     crate::ca_devices::bootstrap_ca();
 
-    let re = Arc::new(RunEngine::new(Vec::new()));
+    // Optional ZMQ document fan-out — bluesky `Publisher` envelope.
+    // Bound on a separate PUB socket; downstream Python consumers
+    // attach a `bluesky.callbacks.zmq.RemoteDispatcher`.
+    let mut sinks: Vec<Arc<dyn cirrus_engine::DocumentSink>> = Vec::new();
+    if let Some(addr) = &args.doc_zmq {
+        match cirrus_callbacks::ZmqDocumentSink::bind(addr) {
+            Ok(s) => {
+                eprintln!("cirrus repl: publishing Documents on ZMQ {addr}");
+                sinks.push(Arc::new(s) as Arc<dyn cirrus_engine::DocumentSink>);
+            }
+            Err(e) => {
+                eprintln!("cirrus repl: failed to bind ZMQ {addr}: {e}");
+                return 2;
+            }
+        }
+    }
+
+    let re = Arc::new(RunEngine::new(sinks));
     let lua = match build_lua(re) {
         Ok(l) => l,
         Err(e) => {

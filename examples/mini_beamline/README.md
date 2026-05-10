@@ -28,6 +28,7 @@ done
 | 02 | [`02_monitor.lua`](./02_monitor.lua) | Live PV variation: 10 reads of `mini:current` over 2 s, asserts >1 mA Δ |
 | 03 | [`03_grid_scan.lua`](./03_grid_scan.lua) | 2D `bp.grid_scan` (3×3) on `dot.mtrx` × `dot.mtry` |
 | 04 | [`04_abort.lua`](./04_abort.lua) | `RE:abort()` mid-run cuts a 5 s plan short, sets `exit_status=abort` |
+| 05 | [`05_remote_dispatcher.lua`](./05_remote_dispatcher.lua) + [`.py`](./05_remote_dispatcher.py) | cirrus → ZMQ → Python `bluesky.callbacks.zmq.RemoteDispatcher` (msgpack envelope round-trip) |
 | 06 | [`06_dcm_energy.lua`](./06_dcm_energy.lua) | Kohzu DCM energy scan (6 → 12 keV via derived motor record) |
 
 Run any one with:
@@ -39,11 +40,13 @@ cargo run -p cirrus-cli -- repl --script examples/mini_beamline/01_scan.lua
 
 ## What's covered elsewhere (no script here)
 
-- **#5 ZMQ document envelope**: `cirrus-callbacks::zmq_source::pub_sub_round_trip_msgpack`
-  unit test covers cirrus → cirrus over ZMQ. Wire-format compatibility
-  with bluesky's `bluesky.callbacks.zmq.RemoteDispatcher` follows from
-  the same `<prefix> <name> <body>` envelope shape (see
-  `crates/cirrus-callbacks/src/zmq_sink.rs`).
+- **#5 ZMQ envelope (cirrus → cirrus)**:
+  `cirrus-callbacks::zmq_source::pub_sub_round_trip_msgpack` unit
+  test covers the internal round-trip path.
+- **#5 ZMQ envelope (cirrus → bluesky Python)**: see
+  `05_remote_dispatcher.{lua,py}` above. Run as a pair (Python
+  subscriber first, cirrus publishes ~1 s later). `RemoteDispatcher`
+  consumes cirrus's documents unchanged.
 
 ## Deferred (not yet covered)
 
@@ -59,9 +62,11 @@ cargo run -p cirrus-cli -- repl --script examples/mini_beamline/01_scan.lua
 Last good run on 2026-05-11 (m3 macOS, mini_ioc release build):
 
 ```
-01_scan.lua       — 17 events, exit_status=success, gauss profile (28k / 96k peak / 29k)
-02_monitor.lua    — Δ=49 mA over 2s
-03_grid_scan.lua  — 9 events (3×3), exit_status=success
-04_abort.lua      — exit_status=abort, plan cut from 5s to <0.1s
-06_dcm_energy.lua — 7 events (6→12 keV), exit_status=success
+01_scan.lua             — 17 events, exit_status=success, gauss profile (28k / 96k peak / 29k)
+02_monitor.lua          — Δ=49 mA over 2s
+03_grid_scan.lua        — 9 events (3×3), exit_status=success
+04_abort.lua            — exit_status=abort, plan cut from 5s to <0.1s
+05_remote_dispatcher    — Python RemoteDispatcher receives 5 events + descriptor + stop;
+                          run_uid matches cirrus side; exit_status=success
+06_dcm_energy.lua       — 7 events (6→12 keV), exit_status=success
 ```
