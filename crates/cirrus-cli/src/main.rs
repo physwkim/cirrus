@@ -70,6 +70,15 @@ fn main() {
         // Server / client paths build their own multi-thread tokio
         // runtime — neither needs the caller's runtime.
         TopCmd::QsManager(a) => {
+            // Bootstrap the CA backend's global client BEFORE the
+            // tokio runtime starts. `ca_context()` block_on's
+            // `CaClient::new()` once and panics if invoked from
+            // inside an active runtime — calling it here from sync
+            // main pre-warms the cache so subsequent
+            // `CaMotor::connect_async` / `CaDetector::connect_async`
+            // calls in the daemon flow stay fully async.
+            #[cfg(feature = "ca")]
+            ca_devices::bootstrap_ca();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

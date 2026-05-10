@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
-use cirrus_core::msg::{MovableObj, ReadableObj};
+use cirrus_core::msg::{LocatableObj, MovableObj, ReadableObj};
 use cirrus_qs::{Registry, Server};
 use clap::Args;
 use tokio::sync::Mutex as TMutex;
@@ -57,6 +57,22 @@ pub struct ManagerArgs {
     /// went down?". Default: `~/.cirrus/checkpoints.jsonl`.
     #[arg(long)]
     checkpoints: Option<std::path::PathBuf>,
+
+    /// Register a CA-backed motor. Repeatable. Format:
+    /// `name=val_pv,rbv_pv` — e.g.
+    /// `--ca-motor ph_mtr=mini:ph:mtr.VAL,mini:ph:mtr.RBV`.
+    /// (Comma rather than colon between PVs because EPICS PV names
+    /// embed `:` already.) Requires the `ca` feature (default).
+    #[cfg(feature = "ca")]
+    #[arg(long = "ca-motor", value_name = "NAME=VAL_PV,RBV_PV")]
+    ca_motor: Vec<String>,
+
+    /// Register a CA-backed scalar detector. Repeatable. Format:
+    /// `name=value_pv` — e.g.
+    /// `--ca-detector ph_det=mini:ph:DetValue_RBV`.
+    #[cfg(feature = "ca")]
+    #[arg(long = "ca-detector", value_name = "NAME=PV")]
+    ca_detector: Vec<String>,
 }
 
 /// Entry point — returns a process exit code.
@@ -82,6 +98,66 @@ pub async fn run(args: ManagerArgs) -> i32 {
         reg.register_movable(&name, motor as Arc<dyn MovableObj>);
     }
     reg.register_plan_count("count");
+
+    // Register CA-backed devices supplied via flags. Bootstrap CA
+    // first (sync, off-runtime). Each `--ca-motor name=val:rbv`
+    // and `--ca-detector name=pv` line spawns one CaMotor /
+    // CaDetector and inserts it into both the device registry
+    // (so the queue worker / lua_eval see them) and triggers a
+    // single connect.
+    #[cfg(feature = "ca")]
+    {
+        // CA bootstrap was already done by `main.rs` before the
+        // tokio runtime started — calling `ca_context()` here from
+        // inside `async fn run` would trigger nested-runtime panic.
+        for spec in &args.ca_motor {
+            let (name, pvs) = match spec.split_once('=') {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "cirrus qs-manager: --ca-motor expects 'name=val_pv:rbv_pv', got {spec:?}"
+                    );
+                    return 2;
+                }
+            };
+            let (val_pv, rbv_pv) = match pvs.split_once(',') {
+                Some(p) => p,
+                None => {
+                    eprintln!("cirrus qs-manager: --ca-motor PVs must be 'val,rbv', got {pvs:?}");
+                    return 2;
+                }
+            };
+            let m = match crate::ca_devices::CaMotor::connect_async(name, val_pv, rbv_pv).await {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("cirrus qs-manager: ca_motor {name}: {e}");
+                    return 2;
+                }
+            };
+            reg.register_readable(name, m.clone() as Arc<dyn ReadableObj>);
+            reg.register_movable(name, m.clone() as Arc<dyn MovableObj>);
+            reg.register_locatable(name, m as Arc<dyn LocatableObj>);
+            tracing::info!(target: "cirrus-qs", "registered ca_motor {name} → {val_pv} / {rbv_pv}");
+        }
+        for spec in &args.ca_detector {
+            let (name, pv) = match spec.split_once('=') {
+                Some(p) => p,
+                None => {
+                    eprintln!("cirrus qs-manager: --ca-detector expects 'name=pv', got {spec:?}");
+                    return 2;
+                }
+            };
+            let d = match crate::ca_devices::CaDetector::connect_async(name, pv).await {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("cirrus qs-manager: ca_detector {name}: {e}");
+                    return 2;
+                }
+            };
+            reg.register_readable(name, d as Arc<dyn ReadableObj>);
+            tracing::info!(target: "cirrus-qs", "registered ca_detector {name} → {pv}");
+        }
+    }
 
     // Share the engine slot + registry between Server and the
     // daemon-side Lua bridge so `lua_eval` resolves the same `RE`

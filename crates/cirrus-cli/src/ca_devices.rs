@@ -65,6 +65,21 @@ impl CaMotor {
             readback: rb,
         }))
     }
+
+    /// Async equivalent — call from inside an existing tokio runtime
+    /// (e.g. `cirrus qs-manager`'s `async fn run`). Same outcome as
+    /// `connect_blocking` but doesn't trigger a nested-runtime panic.
+    pub async fn connect_async(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Arc<Self>> {
+        let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
+        let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
+        sp.connect(Duration::from_secs(5)).await?;
+        rb.connect(Duration::from_secs(5)).await?;
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            setpoint: sp,
+            readback: rb,
+        }))
+    }
 }
 
 impl NamedObj for CaMotor {
@@ -158,6 +173,18 @@ impl CaDetector {
         let v_for_async = v.clone();
         cirrus_core::runtime::cirrus_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            value: v,
+            seen: AtomicI64::new(0),
+        }))
+    }
+
+    /// Async equivalent of `connect_blocking` — for callers
+    /// already inside a tokio runtime (qs-manager's `async fn`).
+    pub async fn connect_async(name: &str, value_pv: &str) -> Result<Arc<Self>> {
+        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
+        v.connect(Duration::from_secs(5)).await?;
         Ok(Arc::new(Self {
             name: name.to_string(),
             value: v,

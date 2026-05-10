@@ -236,6 +236,12 @@ pub struct ReplArgs {
     #[arg(long, value_name = "ADDR")]
     pub doc_zmq: Option<String>,
 
+    /// Optional path to a JSONL file. Every Document the engine
+    /// emits is appended as one JSON line. File is opened in
+    /// append mode — multiple runs accumulate.
+    #[arg(long, value_name = "PATH")]
+    pub doc_jsonl: Option<std::path::PathBuf>,
+
     /// Optional Tiled HTTP endpoint. When set, every Document the
     /// engine emits is registered into the named container on the
     /// Tiled catalog. Example: `--doc-tiled http://localhost:8000`.
@@ -280,6 +286,24 @@ pub fn run(args: ReplArgs) -> i32 {
             }
             Err(e) => {
                 eprintln!("cirrus repl: failed to bind ZMQ {addr}: {e}");
+                return 2;
+            }
+        }
+    }
+
+    if let Some(path) = &args.doc_jsonl {
+        match cirrus_core::runtime::cirrus_runtime()
+            .block_on(cirrus_callbacks::JsonlSink::open(path))
+        {
+            Ok(s) => {
+                eprintln!(
+                    "cirrus repl: appending Documents as JSONL to {}",
+                    path.display()
+                );
+                sinks.push(Arc::new(s) as Arc<dyn cirrus_engine::DocumentSink>);
+            }
+            Err(e) => {
+                eprintln!("cirrus repl: failed to open JSONL {}: {e}", path.display());
                 return 2;
             }
         }

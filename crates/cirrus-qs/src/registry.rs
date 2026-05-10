@@ -2,7 +2,7 @@
 
 use cirrus_core::lua_exposable::LuaMethodEntry;
 use cirrus_core::msg::{
-    CollectableObj, FlyableObj, MovableObj, ReadableObj, StageableObj, TriggerableObj,
+    CollectableObj, FlyableObj, LocatableObj, MovableObj, ReadableObj, StageableObj, TriggerableObj,
 };
 use cirrus_core::plan::Plan;
 use serde_json::Value;
@@ -37,6 +37,7 @@ pub struct Registry {
     plans: HashMap<String, PlanFactory>,
     readables: HashMap<String, Arc<dyn ReadableObj>>,
     movables: HashMap<String, Arc<dyn MovableObj>>,
+    locatables: HashMap<String, Arc<dyn LocatableObj>>,
     triggerables: HashMap<String, Arc<dyn TriggerableObj>>,
     stageables: HashMap<String, Arc<dyn StageableObj>>,
     flyables: HashMap<String, Arc<dyn FlyableObj>>,
@@ -66,6 +67,12 @@ impl Registry {
     /// Register a `MovableObj` device.
     pub fn register_movable(&mut self, name: impl Into<String>, obj: Arc<dyn MovableObj>) {
         self.movables.insert(name.into(), obj);
+    }
+
+    /// Register a `LocatableObj` device. Locatable extends Movable;
+    /// register both for full motor surface (set + locate).
+    pub fn register_locatable(&mut self, name: impl Into<String>, obj: Arc<dyn LocatableObj>) {
+        self.locatables.insert(name.into(), obj);
     }
 
     /// Register a `TriggerableObj` device.
@@ -122,6 +129,11 @@ impl Registry {
     /// Look up a `MovableObj` by name.
     pub fn movable(&self, name: &str) -> Option<&Arc<dyn MovableObj>> {
         self.movables.get(name)
+    }
+
+    /// Look up a `LocatableObj` by name.
+    pub fn locatable(&self, name: &str) -> Option<&Arc<dyn LocatableObj>> {
+        self.locatables.get(name)
     }
 
     /// Look up a `TriggerableObj` by name.
@@ -192,6 +204,9 @@ impl Registry {
             s.insert(k.clone());
         }
         for k in self.movables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.locatables.keys() {
             s.insert(k.clone());
         }
         for k in self.triggerables.keys() {

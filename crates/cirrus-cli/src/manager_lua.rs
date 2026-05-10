@@ -87,7 +87,7 @@ impl ManagerLuaState {
                 name: name.clone(),
                 readable: registry.readable(&name).cloned(),
                 movable: registry.movable(&name).cloned(),
-                locatable: None,
+                locatable: registry.locatable(&name).cloned(),
                 stoppable: None,
                 triggerable: registry.triggerable(&name).cloned(),
                 stageable: registry.stageable(&name).cloned(),
