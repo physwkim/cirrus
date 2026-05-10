@@ -231,6 +231,15 @@ pub struct ReplArgs {
 
 /// Entry point — returns process exit code.
 pub fn run(args: ReplArgs) -> i32 {
+    // Bootstrap the CA backend's global client BEFORE building the
+    // Lua state. The CA backend's `ca_context()` block_on's
+    // `CaClient::new()` once, which panics if called from inside an
+    // active tokio runtime. Calling it here from the sync `repl::run`
+    // entry pre-warms the cache so subsequent `ca_motor` /
+    // `ca_detector` Lua factories don't trip the runtime check.
+    #[cfg(feature = "ca")]
+    crate::ca_devices::bootstrap_ca();
+
     let re = Arc::new(RunEngine::new(Vec::new()));
     let lua = match build_lua(re) {
         Ok(l) => l,

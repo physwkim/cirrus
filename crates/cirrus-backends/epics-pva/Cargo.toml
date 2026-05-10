@@ -6,7 +6,10 @@ license.workspace = true
 description = "EPICS PV Access backend for cirrus, built on epics-pva-rs."
 
 [features]
-default = []
+default = ["real"]
+# Links `epics-pva-rs`. On by default for the same reason as
+# `cirrus-backend-epics-ca` — disable via `--no-default-features`
+# for the stub.
 real = ["dep:epics-pva-rs"]
 
 [dependencies]

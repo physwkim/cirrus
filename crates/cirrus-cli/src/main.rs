@@ -13,6 +13,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "ca")]
+mod ca_devices;
 mod checkpoint_store;
 mod client;
 mod doctor;

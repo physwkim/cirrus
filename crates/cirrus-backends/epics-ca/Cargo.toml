@@ -6,10 +6,13 @@ license.workspace = true
 description = "EPICS Channel Access backend for cirrus, built on epics-ca-rs."
 
 [features]
-default = []
-# When enabled, links `epics-ca-rs` and exposes a real `SignalBackend`.
-# Disabled by default so the rest of the workspace builds without dragging in
-# the full EPICS Rust stack.
+default = ["real"]
+# Links `epics-ca-rs` and exposes a real `SignalBackend`. On by
+# default — beamline tooling expects live CA. Disable with
+# `--no-default-features` to build the stub (returns
+# `Backend("epics-ca disabled — enable feature `real`")` on every
+# call) so a host without EPICS libs can still compile the
+# workspace.
 real = ["dep:epics-ca-rs", "dep:epics-base-rs"]
 
 [dependencies]
