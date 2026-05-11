@@ -689,14 +689,13 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
- "cirrus-backend-epics-ca",
- "cirrus-backend-epics-pva",
  "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",
  "cirrus-derive",
  "cirrus-engine",
  "cirrus-event-model",
+ "cirrus-host",
  "cirrus-plans",
  "cirrus-protocols-async",
  "cirrus-qs",
@@ -709,11 +708,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tiled-client",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
  "zmq",
 ]
 
@@ -787,6 +784,33 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "cirrus-host"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "cirrus-backend-epics-ca",
+ "cirrus-backend-epics-pva",
+ "cirrus-backend-soft",
+ "cirrus-core",
+ "cirrus-derive",
+ "cirrus-engine",
+ "cirrus-event-model",
+ "cirrus-plans",
+ "cirrus-protocols-async",
+ "cirrus-qs",
+ "futures",
+ "mlua",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tiled-client",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1344,9 +1368,9 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9e9de133a6c6262a0fe5f743b4e128dcf5b513733e8949d8e0b24edf95e86f"
+checksum = "2635741c5b9a502eb2805deb8a4cfffb533dacaf1c9367932cc4fc25e280b7ce"
 dependencies = [
  "bytes",
  "chrono",
@@ -1364,9 +1388,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20b03e23eb398bf05316b13cbefb3a37a8fc128547cc6782dc875372890c9646"
+checksum = "7a0571e62a1e03cd649579f8573410cce23a045380d7b5a08729830842b4a2da"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1384,9 +1408,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b000d2f72375cd04f73ab5d5cdbdb780d121cb4f41cce78eda8ee714cab25011"
+checksum = "14c0fd8e14c85d329edaba14a0ce009c4419d729360a58ff54b7cef3680a3b7a"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1396,9 +1420,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc6c84f6602429cbe8592e4cfbfd770abe9a5030d6a2be33f32b57f9d2c66a23"
+checksum = "bde55e4b87ac7a03cf9ee470ee7aebe6c3d15803930586e1cb2bcd7609535d27"
 dependencies = [
  "bytes",
  "chrono",
@@ -2567,6 +2591,24 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "mini-beamline-qs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cirrus-core",
+ "cirrus-derive",
+ "cirrus-engine",
+ "cirrus-event-model",
+ "cirrus-host",
+ "cirrus-qs",
+ "clap",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

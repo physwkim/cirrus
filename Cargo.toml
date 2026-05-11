@@ -21,8 +21,10 @@ members = [
     "crates/cirrus-callbacks",
     "crates/cirrus",
     "crates/cirrus-cli",
+    "crates/cirrus-host",
     "crates/cirrus-qs",
     "crates/cirrus-py",
+    "examples/mini_beamline_qs",
 ]
 
 [workspace.package]
@@ -67,6 +69,7 @@ cirrus-stream         = { path = "crates/cirrus-stream" }
 cirrus-callbacks      = { path = "crates/cirrus-callbacks" }
 cirrus-derive         = { path = "crates/cirrus-derive" }
 cirrus-qs             = { path = "crates/cirrus-qs" }
+cirrus-host           = { path = "crates/cirrus-host" }
 
 [profile.dev]
 opt-level = 1

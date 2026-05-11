@@ -24,15 +24,12 @@ cirrus-event-model.workspace = true
 cirrus-callbacks.workspace = true
 cirrus-plans.workspace = true
 cirrus-qs.workspace = true
+cirrus-host.workspace = true
 cirrus-backend-soft.workspace = true
-tiled-client = { git = "https://github.com/physwkim/tiled-rs.git", branch = "main", optional = true }
-url = { version = "2", optional = true }
 cirrus-stream = { workspace = true, optional = true }
 cirrus-protocols-async = { workspace = true, optional = true }
-epics-pva-rs = { version = "0.16.0", optional = true }
+epics-pva-rs = { version = "0.16.1", optional = true }
 bytes = { workspace = true, optional = true }
-cirrus-backend-epics-ca = { path = "../cirrus-backends/epics-ca", optional = true }
-cirrus-backend-epics-pva = { path = "../cirrus-backends/epics-pva", optional = true }
 
 [features]
 default = ["ca", "pva"]
@@ -40,7 +37,7 @@ default = ["ca", "pva"]
 # metadata / get) AND the `--doc-tiled` repl flag that wires
 # `cirrus-callbacks::TiledSink` (write-side: register Documents
 # into a Tiled catalog).
-tiled = ["dep:tiled-client", "dep:url", "cirrus-callbacks/tiled"]
+tiled = ["cirrus-host/tiled", "cirrus-callbacks/tiled"]
 # Wire real backends (PvaMonitorSource + Hdf5FrameSink) into the
 # `cirrus frame-source` subcommand. Without this feature the
 # subcommand is a scaffolded stub that prints args and exits.
@@ -56,19 +53,11 @@ frame-source = [
 # Expose `ca_motor(name, val_pv, rbv_pv)` and
 # `ca_detector(name, value_pv)` Lua factories that connect to a
 # live EPICS Channel Access IOC. Pulls in `epics-ca-rs` via
-# cirrus-backend-epics-ca's `real` feature.
-ca = [
-    "dep:cirrus-backend-epics-ca",
-    "cirrus-backend-epics-ca/real",
-    "dep:cirrus-protocols-async",
-]
+# cirrus-backend-epics-ca's `real` feature (through cirrus-host).
+ca = ["cirrus-host/ca"]
 # Symmetric for PV Access — `pva_motor` / `pva_detector` Lua
 # factories on top of `cirrus-backend-epics-pva`.
-pva = [
-    "dep:cirrus-backend-epics-pva",
-    "cirrus-backend-epics-pva/real",
-    "dep:cirrus-protocols-async",
-]
+pva = ["cirrus-host/pva"]
 
 [dev-dependencies]
 cirrus-derive.workspace = true

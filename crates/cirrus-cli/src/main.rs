@@ -13,22 +13,11 @@
 
 #![deny(missing_docs)]
 
-#[cfg(feature = "ca")]
-mod ca_devices;
-#[cfg(feature = "ca")]
-mod ca_suspender;
-mod checkpoint_store;
 mod client;
 mod doctor;
 mod frame_source;
-mod lua_env;
-#[cfg(feature = "tiled")]
-mod lua_tiled;
 mod manager;
-mod manager_lua;
 mod migrate;
-#[cfg(feature = "pva")]
-mod pva_devices;
 mod repl;
 
 use clap::{Parser, Subcommand};
@@ -80,7 +69,7 @@ fn main() {
             // `CaMotor::connect_async` / `CaDetector::connect_async`
             // calls in the daemon flow stay fully async.
             #[cfg(feature = "ca")]
-            ca_devices::bootstrap_ca();
+            cirrus_host::ca_devices::bootstrap_ca();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

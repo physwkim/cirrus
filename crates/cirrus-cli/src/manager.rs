@@ -8,8 +8,8 @@ use cirrus_qs::{Registry, Server};
 use clap::Args;
 use tokio::sync::Mutex as TMutex;
 
-use crate::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
-use crate::manager_lua::ManagerLuaState;
+use cirrus_host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
+use cirrus_host::manager_lua::ManagerLuaState;
 
 /// Arguments for `cirrus qs-manager`.
 #[derive(Args, Debug)]
@@ -127,13 +127,14 @@ pub async fn run(args: ManagerArgs) -> i32 {
                     return 2;
                 }
             };
-            let m = match crate::ca_devices::CaMotor::connect_async(name, val_pv, rbv_pv).await {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("cirrus qs-manager: ca_motor {name}: {e}");
-                    return 2;
-                }
-            };
+            let m =
+                match cirrus_host::ca_devices::CaMotor::connect_async(name, val_pv, rbv_pv).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("cirrus qs-manager: ca_motor {name}: {e}");
+                        return 2;
+                    }
+                };
             reg.register_readable(name, m.clone() as Arc<dyn ReadableObj>);
             reg.register_movable(name, m.clone() as Arc<dyn MovableObj>);
             reg.register_locatable(name, m as Arc<dyn LocatableObj>);
@@ -147,7 +148,7 @@ pub async fn run(args: ManagerArgs) -> i32 {
                     return 2;
                 }
             };
-            let d = match crate::ca_devices::CaDetector::connect_async(name, pv).await {
+            let d = match cirrus_host::ca_devices::CaDetector::connect_async(name, pv).await {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("cirrus qs-manager: ca_detector {name}: {e}");

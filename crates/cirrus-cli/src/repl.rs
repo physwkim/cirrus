@@ -34,7 +34,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
-use crate::lua_env::build_lua;
+use cirrus_host::lua_env::build_lua;
 
 /// Static completion of cirrus's well-known Lua globals + namespaces.
 ///
@@ -272,7 +272,7 @@ pub fn run(args: ReplArgs) -> i32 {
     // entry pre-warms the cache so subsequent `ca_motor` /
     // `ca_detector` Lua factories don't trip the runtime check.
     #[cfg(feature = "ca")]
-    crate::ca_devices::bootstrap_ca();
+    cirrus_host::ca_devices::bootstrap_ca();
 
     // Optional ZMQ document fan-out — bluesky `Publisher` envelope.
     // Bound on a separate PUB socket; downstream Python consumers
