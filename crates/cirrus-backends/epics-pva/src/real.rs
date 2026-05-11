@@ -261,6 +261,55 @@ mod tests {
         assert_eq!(pv_field_to_f64(&bare), Some(3.14));
     }
 
+    // Live-IOC monitor smoke test. Marked #[ignore] because it
+    // requires the mini-beamline mini_ioc to be running and reachable.
+    // Run manually with:
+    //   cargo test -p cirrus-backend-epics-pva --features real \
+    //       --lib pva_monitor_live_mini_current -- --ignored --nocapture
+    // PV `mini:current` is a 1Hz oscillating beam-current readback —
+    // we should get multiple callback invocations within 3 seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn pva_monitor_live_mini_current() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let backend: EpicsPvaBackend<f64> = EpicsPvaBackend::new("mini:current");
+        // Bootstrap the channel so the monitor finds it quickly.
+        backend
+            .connect(Duration::from_secs(3))
+            .await
+            .expect("pvconnect mini:current");
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let last_ts: Arc<std::sync::Mutex<f64>> = Arc::new(std::sync::Mutex::new(0.0));
+        let count_cb = count.clone();
+        let last_ts_cb = last_ts.clone();
+        let cb: ReadingValueCallback<f64> = Box::new(move |_v: &f64, ts: f64| {
+            count_cb.fetch_add(1, Ordering::SeqCst);
+            *last_ts_cb.lock().unwrap() = ts;
+        });
+        let _tok = backend.set_callback(Some(cb));
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let got = count.load(Ordering::SeqCst);
+        let ts = *last_ts.lock().unwrap();
+        eprintln!(
+            "pva_monitor_live_mini_current: {got} callbacks, last ts={ts}"
+        );
+        assert!(got > 0, "no monitor callbacks received in 3s");
+        // mini_ioc publishes NTScalar with server timeStamp; the
+        // extracted ts should be within ~5 minutes of now() — confirms
+        // the timeStamp substructure path actually fired.
+        let now = now_ts();
+        assert!(
+            (now - ts).abs() < 300.0,
+            "last timestamp {ts} is not close to now {now} \
+             (server timestamp may not be extracted)"
+        );
+    }
+
     #[test]
     fn timestamp_none_when_substructure_missing_seconds() {
         // NTScalar-shaped but `secondsPastEpoch` is absent — treat as
