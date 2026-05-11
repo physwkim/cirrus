@@ -184,8 +184,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
         // one-shot WARN per PV so operators can see that local-clock
         // timestamps are being substituted (the fallback is otherwise
         // invisible).
-        let request = PvRequestExpr::parse("field(value,timeStamp)")
-            .unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -230,10 +229,14 @@ mod tests {
 
     fn ntscalar_with_ts(value: f64, secs: i64, nanos: i32) -> PvField {
         let mut ts = PvStructure::new("time_t");
-        ts.fields
-            .push(("secondsPastEpoch".into(), PvField::Scalar(ScalarValue::Long(secs))));
-        ts.fields
-            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(nanos))));
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(secs)),
+        ));
+        ts.fields.push((
+            "nanoseconds".into(),
+            PvField::Scalar(ScalarValue::Int(nanos)),
+        ));
         let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
         nt.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
@@ -255,10 +258,10 @@ mod tests {
         // Server publishes a raw scalar (no NTScalar wrapper) — no
         // server timestamp is available. `pv_field_to_ts` returns
         // None so the monitor closure can fall through to `now_ts`.
-        let bare = PvField::Scalar(ScalarValue::Double(3.14));
+        let bare = PvField::Scalar(ScalarValue::Double(2.5));
         assert!(pv_field_to_ts(&bare).is_none());
         // Value still extractable.
-        assert_eq!(pv_field_to_f64(&bare), Some(3.14));
+        assert_eq!(pv_field_to_f64(&bare), Some(2.5));
     }
 
     // Live-IOC monitor smoke test. Marked #[ignore] because it
@@ -295,9 +298,7 @@ mod tests {
 
         let got = count.load(Ordering::SeqCst);
         let ts = *last_ts.lock().unwrap();
-        eprintln!(
-            "pva_monitor_live_mini_current: {got} callbacks, last ts={ts}"
-        );
+        eprintln!("pva_monitor_live_mini_current: {got} callbacks, last ts={ts}");
         assert!(got > 0, "no monitor callbacks received in 3s");
         // mini_ioc publishes NTScalar with server timeStamp; the
         // extracted ts should be within ~5 minutes of now() — confirms

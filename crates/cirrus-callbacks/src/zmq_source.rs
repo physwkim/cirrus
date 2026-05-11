@@ -340,6 +340,9 @@ mod tests {
         cancel.cancel();
         let _ = driver.await;
 
-        assert!(count.load(Ordering::SeqCst) > 0, "engine subscriber never fired");
+        assert!(
+            count.load(Ordering::SeqCst) > 0,
+            "engine subscriber never fired"
+        );
     }
 }

@@ -1196,9 +1196,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                         &direction,
                         re_for_susp.clone(),
                     ))
-                    .map_err(|e| {
-                        mlua::Error::RuntimeError(format!("ca_suspend_threshold: {e}"))
-                    })?;
+                    .map_err(|e| mlua::Error::RuntimeError(format!("ca_suspend_threshold: {e}")))?;
                 Ok(())
             },
         )?;
