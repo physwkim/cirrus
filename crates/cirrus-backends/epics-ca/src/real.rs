@@ -110,14 +110,29 @@ impl CaContext {
 static CTX: OnceLock<Arc<CaContext>> = OnceLock::new();
 
 /// Get the shared CA context. Initializes a `CaClient` on first call.
+///
+/// `CaClient::new` is async; when invoked from a sync caller that is
+/// itself already inside a tokio runtime (e.g. a tokio task that
+/// constructs `EpicsCaBackend::new(pv)` lazily) the naive
+/// `cirrus_runtime().block_on(...)` panics with "Cannot start a runtime
+/// from within a runtime". We detect that case via
+/// `Handle::try_current()` and bridge through a dedicated OS thread
+/// whose context is free of any runtime, then `block_on` on the cirrus
+/// process-singleton runtime there.
 pub fn ca_context() -> Arc<CaContext> {
     if let Some(c) = CTX.get() {
         return c.clone();
     }
-    // CaClient::new is async; bootstrap via the cirrus runtime.
-    let client = cirrus_core::runtime::cirrus_runtime()
-        .block_on(CaClient::new())
-        .expect("CaClient::new failed");
+    let client_res = if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| cirrus_core::runtime::cirrus_runtime().block_on(CaClient::new()))
+                .join()
+                .expect("ca_context: bootstrap thread panicked")
+        })
+    } else {
+        cirrus_core::runtime::cirrus_runtime().block_on(CaClient::new())
+    };
+    let client = client_res.expect("CaClient::new failed");
     let ctx = Arc::new(CaContext::new(client));
     let _ = CTX.set(ctx.clone());
     ctx
@@ -279,5 +294,22 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     }
     fn source(&self, name: &str) -> String {
         format!("ca://{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for the bootstrap bug documented at doc/10-roadmap.md
+    // Tier 1.1: calling `ca_context()` from inside a tokio runtime
+    // previously panicked with "Cannot start a runtime from within a
+    // runtime". The fix routes through a dedicated OS thread when a
+    // current runtime is detected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ca_context_initializes_from_inside_runtime() {
+        // Must not panic. Returns an Arc; we don't dereference into
+        // any I/O so the IOC need not be present.
+        let _ = ca_context();
     }
 }

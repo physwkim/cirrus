@@ -21,13 +21,11 @@ bottom for reference.
 - **Remaining**: wrap as a CI-automated test (spawn `mini_ioc`
   inside the test fixture). Blocked on either packaging the IOC
   binary alongside cirrus or vendoring `epics-rs::IocBuilder`.
-- **Side fix needed**: `cirrus_backend_epics_ca::ca_context()`
-  panics with "Cannot start a runtime from within a runtime" when
-  called from inside a tokio runtime — bootstrap path uses
-  `block_on` directly. The example works around it by calling
-  `ca_context()` once from a sync `main` before spawning the
-  runtime; the backend itself should detect `Handle::try_current()`
-  and route via `spawn_blocking` when already in a runtime.
+- **Side fix**: SHIPPED. `ca_context()` now checks
+  `Handle::try_current()` and bridges through a dedicated
+  `std::thread::scope` worker when invoked from inside an existing
+  tokio runtime, eliminating the panic. Regression covered by
+  `cirrus_backend_epics_ca::real::tests::ca_context_initializes_from_inside_runtime`.
 
 ## Tier 2 — ecosystem residue
 
@@ -52,10 +50,10 @@ bottom for reference.
   (no-op — see decision below), relative_set_wrapper,
   print_summary_wrapper, suspend_wrapper, fly_during_wrapper,
   contingency_wrapper, reset_positions_wrapper,
-  configure_count_time_wrapper all shipped.
-- **Plan**: `lazily_stage_wrapper` (auto-stage on first touch),
-  `set_run_key_wrapper` (multi-run plans), `stub_wrapper` (assert
-  no open run) remain. Each <1 day.
+  configure_count_time_wrapper, lazily_stage_wrapper,
+  set_run_key_wrapper, stub_wrapper all shipped.
+  Latest three are also exposed as `bpp.lazily_stage_wrapper`,
+  `bpp.set_run_key_wrapper`, `bpp.stub_wrapper` in the Lua surface.
 
 ### 2.4 Real frame-source backends behind D21
 - **Status**: `cirrus frame-source` subcommand + Document-plane wire
@@ -67,10 +65,17 @@ bottom for reference.
 ## Tier 3 — operational residue
 
 ### 3.1 Backup / recovery for in-progress runs
-- **Status**: pause/resume is in-process only.
-- **Plan**: write `Msg::Checkpoint` cache to disk every N seconds;
-  on restart, replay from the latest checkpoint. Multi-day, needs
-  format design + integration with `RunEngine::run_async`.
+- **Status**: detection path SHIPPED. `CheckpointSnapshot.exit_status`
+  now distinguishes mid-run `Msg::Checkpoint` records from
+  post-`CloseRun` records; `JsonlCheckpointStore::unfinished_run`
+  walks the JSONL audit log and surfaces any run that hit a
+  checkpoint but never closed. `cirrus qs-manager` emits a structured
+  WARN at startup if such a record is present, so an operator knows
+  to re-issue the abandoned plan. Pause/resume itself is still
+  in-process only.
+- **Remaining**: actual plan replay (auto-resume from the last
+  checkpoint). That still requires plan-source persistence and
+  msg_cache replay; multi-day.
 
 ### 3.2 Prometheus metrics + health probes
 - **Status**: SHIPPED (`54e0bc8`). `cirrus-qs/metrics` feature exposes

@@ -7,7 +7,9 @@ use cirrus_core::status::{Status, StatusError, SubToken};
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::{PvField, ScalarValue};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -76,6 +78,39 @@ fn pv_field_to_f64(p: &PvField) -> Option<f64> {
     }
 }
 
+// NTScalar carries an optional `timeStamp` substructure with
+// `secondsPastEpoch` (Long) and `nanoseconds` (Int). Return the
+// composed `f64` epoch timestamp when both are present; None otherwise.
+fn pv_field_to_ts(p: &PvField) -> Option<f64> {
+    let PvField::Structure(s) = p else {
+        return None;
+    };
+    let ts = s.fields.iter().find(|(n, _)| n == "timeStamp")?;
+    let PvField::Structure(t) = &ts.1 else {
+        return None;
+    };
+    let secs = t
+        .fields
+        .iter()
+        .find(|(n, _)| n == "secondsPastEpoch")
+        .and_then(|(_, f)| match f {
+            PvField::Scalar(ScalarValue::Long(l)) => Some(*l as f64),
+            PvField::Scalar(ScalarValue::ULong(u)) => Some(*u as f64),
+            _ => None,
+        })?;
+    let nanos = t
+        .fields
+        .iter()
+        .find(|(n, _)| n == "nanoseconds")
+        .and_then(|(_, f)| match f {
+            PvField::Scalar(ScalarValue::Int(i)) => Some(*i as f64),
+            PvField::Scalar(ScalarValue::UInt(u)) => Some(*u as f64),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    Some(secs + nanos / 1.0e9)
+}
+
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
@@ -134,13 +169,111 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn get_setpoint(&self) -> Result<f64> {
         SignalBackend::<f64>::get_value(self).await
     }
-    fn set_callback(&self, _cb: Option<ReadingValueCallback<f64>>) -> SubToken {
-        // Full PVA monitor wiring lives in cirrus-stream::sources::pva_mon
-        // for the bulk-data path. Scalar monitor here is left as a TODO so
-        // the backend stays focused on point-in-time get/put.
-        SubToken::noop()
+    fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let client = self.client.clone();
+        let pv = self.pv.clone();
+        // Server timestamps live in NTScalar's `timeStamp` substructure.
+        // Project explicitly so the server is asked to send it and we
+        // also save bandwidth on alarm / display fields we don't use.
+        // Servers publishing bare (non-Normative) scalars simply have no
+        // `timeStamp` to send; we detect that on first frame and emit a
+        // one-shot WARN per PV so operators can see that local-clock
+        // timestamps are being substituted (the fallback is otherwise
+        // invisible).
+        let request = PvRequestExpr::parse("field(value,timeStamp)")
+            .unwrap_or_default();
+        let warned_local_clock = Arc::new(AtomicBool::new(false));
+        let pv_for_cb = pv.clone();
+        let warned_for_cb = warned_local_clock.clone();
+        let handle = tokio::spawn(async move {
+            let res = client
+                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
+                    if let Some(f) = pv_field_to_f64(field) {
+                        let ts = match pv_field_to_ts(field) {
+                            Some(t) => t,
+                            None => {
+                                if !warned_for_cb.swap(true, Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        target: "cirrus_backend_epics_pva",
+                                        "pva {}: monitor frame has no server timeStamp; \
+                                         falling back to local clock for this PV (one-shot)",
+                                        pv_for_cb,
+                                    );
+                                }
+                                now_ts()
+                            }
+                        };
+                        cb(&f, ts);
+                    }
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("pva monitor on {pv}: {e}");
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
     }
     fn source(&self, name: &str) -> String {
         format!("pva://{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_pva_rs::pvdata::PvStructure;
+
+    fn ntscalar_with_ts(value: f64, secs: i64, nanos: i32) -> PvField {
+        let mut ts = PvStructure::new("time_t");
+        ts.fields
+            .push(("secondsPastEpoch".into(), PvField::Scalar(ScalarValue::Long(secs))));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(nanos))));
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
+        nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
+        PvField::Structure(nt)
+    }
+
+    #[test]
+    fn timestamp_extracted_from_ntscalar() {
+        let f = ntscalar_with_ts(42.0, 1_700_000_000, 250_000_000);
+        let ts = pv_field_to_ts(&f).expect("ntscalar timestamp");
+        assert!((ts - 1_700_000_000.25).abs() < 1e-6);
+        let v = pv_field_to_f64(&f).expect("ntscalar value");
+        assert_eq!(v, 42.0);
+    }
+
+    #[test]
+    fn timestamp_none_for_bare_scalar() {
+        // Server publishes a raw scalar (no NTScalar wrapper) — no
+        // server timestamp is available. `pv_field_to_ts` returns
+        // None so the monitor closure can fall through to `now_ts`.
+        let bare = PvField::Scalar(ScalarValue::Double(3.14));
+        assert!(pv_field_to_ts(&bare).is_none());
+        // Value still extractable.
+        assert_eq!(pv_field_to_f64(&bare), Some(3.14));
+    }
+
+    #[test]
+    fn timestamp_none_when_substructure_missing_seconds() {
+        // NTScalar-shaped but `secondsPastEpoch` is absent — treat as
+        // no usable server timestamp rather than fabricating a partial
+        // one.
+        let mut ts = PvStructure::new("time_t");
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(0))));
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
+        let f = PvField::Structure(nt);
+        assert!(pv_field_to_ts(&f).is_none());
     }
 }

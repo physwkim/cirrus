@@ -458,6 +458,23 @@ local p = bp.count({d1}, 1)
 local mutated = bpp.msg_mutator(p, function(m) return m end)
 assert(string.find(RE:run(mutated), "exit_status=success"))
 
+-- lazily_stage_wrapper with no devices = pass-through (soft_* devices
+-- aren't exposed as stageable from Lua; the Rust path is covered by
+-- cirrus-plans unit tests). Empty list still exercises the binding.
+assert(string.find(
+  RE:run(bpp.lazily_stage_wrapper(bp.count({d1}, 1), {})),
+  "exit_status=success"))
+
+-- set_run_key_wrapper: tags every OpenRun with metadata.extra.run_key
+assert(string.find(
+  RE:run(bpp.set_run_key_wrapper(bp.count({d1}, 1), "scan_42")),
+  "exit_status=success"))
+
+-- stub_wrapper: passes through a run-free plan unchanged
+assert(string.find(
+  RE:run(bpp.run_wrapper(bpp.stub_wrapper(bps.read(d1)))),
+  "exit_status="))
+
 print("OK")
 "#,
     );

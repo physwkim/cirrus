@@ -535,9 +535,11 @@ bluesky-style namespaces (full surface):
                                 (run_wrapper, inject_md, rewindable,
                                  monitor_during, stage_wrapper,
                                  baseline_wrapper, finalize_wrapper,
-                                 subs_wrapper, relative_set,
-                                 reset_positions, print_summary,
-                                 contingency, pchain, msg_mutator)
+                                 subs_wrapper, lazily_stage_wrapper,
+                                 set_run_key_wrapper, stub_wrapper,
+                                 relative_set, reset_positions,
+                                 print_summary, contingency, pchain,
+                                 msg_mutator)
 
 Coroutine plans (generator-style) — yield Msg values via the `msg.*`
 namespace:

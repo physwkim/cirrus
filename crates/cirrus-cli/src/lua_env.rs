@@ -3330,6 +3330,33 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     bpp.set(
+        "lazily_stage_wrapper",
+        lua.create_function(|_, (plan_ud, devs_t): (mlua::AnyUserData, mlua::Table)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "lazily_stage_wrapper",
+                pp::lazily_stage_wrapper(inner, devs_of(&devs_t, "stageable")?),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "set_run_key_wrapper",
+        lua.create_function(|_, (plan_ud, key): (mlua::AnyUserData, String)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt(
+                "set_run_key_wrapper",
+                pp::set_run_key_wrapper(inner, key),
+            ))
+        })?,
+    )?;
+    bpp.set(
+        "stub_wrapper",
+        lua.create_function(|_, plan_ud: mlua::AnyUserData| {
+            let inner = take_inner_plan(&plan_ud)?;
+            Ok(wrap_prebuilt("stub_wrapper", pp::stub_wrapper(inner)))
+        })?,
+    )?;
+    bpp.set(
         "relative_set",
         lua.create_function(|_, (plan_ud, motors_t): (mlua::AnyUserData, mlua::Table)| {
             let inner = take_inner_plan(&plan_ud)?;

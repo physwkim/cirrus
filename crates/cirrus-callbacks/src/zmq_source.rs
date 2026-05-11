@@ -43,8 +43,13 @@ use tokio_util::sync::CancellationToken;
 pub use crate::zmq_sink::Serializer;
 
 /// 0MQ SUB-side document receiver.
+///
+/// The socket is wrapped in `Arc<StdMutex<...>>` so the blocking
+/// `recv_bytes` can be dispatched to `tokio::task::spawn_blocking`
+/// — without that, the 250ms `set_rcvtimeo` would pin a tokio worker
+/// thread and starve other tasks on a single-thread runtime.
 pub struct ZmqDocumentSource {
-    socket: StdMutex<zmq::Socket>,
+    socket: Arc<StdMutex<zmq::Socket>>,
     serializer: Serializer,
     cancel: CancellationToken,
 }
@@ -65,7 +70,7 @@ impl ZmqDocumentSource {
         sock.set_subscribe(b"")
             .map_err(|e| CirrusError::Backend(format!("zmq subscribe: {e}")))?;
         Ok(Self {
-            socket: StdMutex::new(sock),
+            socket: Arc::new(StdMutex::new(sock)),
             serializer: Serializer::Msgpack,
             cancel: CancellationToken::new(),
         })
@@ -98,24 +103,35 @@ impl ZmqDocumentSource {
 
     /// Drive the source until cancelled or the socket errors. Each
     /// received Document is broadcast into `engine`'s subscriber
-    /// chain (same path as engine-internal Documents).
-    pub async fn run_into_engine(&self, _engine: Arc<RunEngine>) -> Result<()> {
+    /// chain (same path as engine-internal Documents) via
+    /// [`RunEngine::inject_document`].
+    ///
+    /// The blocking `recv_bytes` is dispatched to
+    /// `tokio::task::spawn_blocking` so the 250ms wait does not pin
+    /// the tokio worker; a single-thread runtime stays responsive
+    /// while waiting on the SUB socket.
+    pub async fn run_into_engine(&self, engine: Arc<RunEngine>) -> Result<()> {
         loop {
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
-            let envelope = {
-                let s = self.socket.lock().unwrap();
-                // Set a short receive timeout so the loop can re-check
-                // the cancel token periodically.
+            let socket = self.socket.clone();
+            let recv = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                let s = socket.lock().unwrap();
+                // Set a short receive timeout so the outer loop can
+                // re-check the cancel token periodically.
                 let _ = s.set_rcvtimeo(250);
                 match s.recv_bytes(0) {
-                    Ok(b) => b,
-                    Err(zmq::Error::EAGAIN) => continue,
-                    Err(e) => {
-                        return Err(CirrusError::Backend(format!("zmq recv: {e}")));
-                    }
+                    Ok(b) => Ok(Some(b)),
+                    Err(zmq::Error::EAGAIN) => Ok(None),
+                    Err(e) => Err(CirrusError::Backend(format!("zmq recv: {e}"))),
                 }
+            })
+            .await
+            .map_err(|e| CirrusError::Backend(format!("zmq spawn_blocking join: {e}")))??;
+            let envelope = match recv {
+                Some(b) => b,
+                None => continue,
             };
             let doc = match decode_envelope(self.serializer, &envelope) {
                 Ok(d) => d,
@@ -124,22 +140,9 @@ impl ZmqDocumentSource {
                     continue;
                 }
             };
-            // Re-publish through the engine. RunEngine doesn't expose
-            // a "broadcast this externally-supplied doc" API, but
-            // `subscribe`d callbacks can be invoked directly via
-            // the document sinks on the engine. We use
-            // RunEngine.subscribe(...) at startup and broadcast via
-            // a side-channel — for now, walk the sinks list. The
-            // simplest path is: yield it as a Msg::Publish through a
-            // hand-built plan; but that requires being inside a run.
-            //
-            // Practical approach: expose a single `inject_document`
-            // public method on RunEngine that runs the same broadcast
-            // path as internal docs. Until that's added, just log
-            // and warn the caller; this scaffolding still validates
-            // the wire format and proves the cancellation works.
-            let _ = doc;
-            tracing::trace!("zmq doc source: received Document; injection path is TODO");
+            if let Err(e) = engine.inject_document(&doc).await {
+                tracing::warn!("zmq doc source: inject failed: {e}");
+            }
         }
     }
 
@@ -277,5 +280,66 @@ mod tests {
             Document::Stop(s) => assert_eq!(s.exit_status, "success"),
             _ => panic!("wrong doc kind"),
         }
+    }
+
+    // Regression for the run_into_engine injection path. Pre-fix the
+    // received Document was decoded but dropped; the subscriber chain
+    // never saw it. With `RunEngine::inject_document` wired, a
+    // subscribe()'d callback on the engine observes every published
+    // doc. Uses the default current-thread runtime — the receive loop
+    // now dispatches the blocking `recv_bytes` to
+    // `tokio::task::spawn_blocking`, so the 250ms wait no longer pins
+    // the worker and the publisher makes progress concurrently.
+    #[tokio::test]
+    async fn run_into_engine_forwards_to_subscribers() {
+        use cirrus_engine::RunEngine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr = format!(
+            "ipc:///tmp/cirrus-zmq-inject-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        );
+        let sink = ZmqDocumentSink::bind(&addr)
+            .expect("bind sink")
+            .with_serializer(Serializer::Msgpack);
+        let cancel = CancellationToken::new();
+        let src = Arc::new(
+            ZmqDocumentSource::connect(&addr)
+                .expect("connect source")
+                .with_serializer(Serializer::Msgpack)
+                .with_cancel(cancel.clone()),
+        );
+
+        let engine = Arc::new(RunEngine::new(Vec::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_cb = count.clone();
+        engine.subscribe(Arc::new(move |_doc: &Document| {
+            count_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let src_loop = src.clone();
+        let engine_loop = engine.clone();
+        let driver = tokio::spawn(async move {
+            let _ = src_loop.run_into_engine(engine_loop).await;
+        });
+
+        let stop = fake_stop();
+        // PUB/SUB slow-joiner — publish repeatedly until the
+        // subscriber sees something.
+        for _ in 0..40 {
+            sink.dispatch(&stop).await.unwrap();
+            if count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        let _ = driver.await;
+
+        assert!(count.load(Ordering::SeqCst) > 0, "engine subscriber never fired");
     }
 }

@@ -181,6 +181,20 @@ pub async fn run(args: ManagerArgs) -> i32 {
             prev.cirrus_version,
         );
     }
+    // Loud warning if the prior daemon left an unfinished run. The
+    // operator needs to decide whether to re-issue the plan; cirrus
+    // does not auto-replay because that requires plan serialization.
+    if let Some(unfinished) = JsonlCheckpointStore::unfinished_run(&ckpt_path) {
+        tracing::warn!(
+            target: "cirrus-qs",
+            "checkpoint store: unfinished run detected — run_uid={:?} \
+             reached a checkpoint at ts={} but never closed. \
+             The previous daemon likely terminated mid-plan; re-issue \
+             the plan manually if recovery is desired.",
+            unfinished.run_uid,
+            unfinished.timestamp_ns,
+        );
+    }
     let ckpt_store = Arc::new(JsonlCheckpointStore::new(ckpt_path.clone()));
     let ckpt_hook = ckpt_store.clone().into_hook();
     tracing::info!(

@@ -97,10 +97,16 @@ pub type Preprocessor = Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static>;
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
-/// Snapshot delivered to a [`CheckpointHook`] on every `Msg::Checkpoint`.
+/// Snapshot delivered to a [`CheckpointHook`] on every `Msg::Checkpoint`
+/// and on every `CloseRun` (with [`exit_status`](Self::exit_status) set).
 /// Lets callers persist enough state to know "the engine reached a
-/// safe point at time T inside run R" without coupling to the
-/// engine's internal types.
+/// safe point at time T inside run R" — or "run R finished cleanly
+/// with status S" — without coupling to the engine's internal types.
+///
+/// Crash-recovery flow: a `Checkpoint` snapshot for run-uid R that is
+/// **not** followed in the audit log by a `CloseRun` snapshot for the
+/// same R means R was abandoned (daemon went down mid-run). See
+/// `cirrus_cli::checkpoint_store::JsonlCheckpointStore::unfinished_run`.
 #[derive(Clone, Debug)]
 pub struct CheckpointSnapshot {
     /// Wall-clock UTC nanoseconds since the unix epoch.
@@ -108,6 +114,11 @@ pub struct CheckpointSnapshot {
     /// `RunStart.uid` of the currently open run, or `None` if no run
     /// is open (between runs).
     pub run_uid: Option<String>,
+    /// `None` for `Msg::Checkpoint` snapshots emitted mid-run.
+    /// `Some(status)` for a snapshot fired right after `CloseRun`
+    /// emitted its RunStop document (`success` / `abort` / `fail` /
+    /// `halt`).
+    pub exit_status: Option<String>,
 }
 
 /// Hook invoked synchronously on every `Msg::Checkpoint`. Implementations
@@ -572,6 +583,16 @@ impl RunEngine {
     /// Remove a subscriber by id. No-op if the id is unknown.
     pub fn unsubscribe(&self, id: SubscriptionId) {
         self.subscribers.lock().unwrap().retain(|(i, _)| *i != id);
+    }
+
+    /// Forward an externally-supplied Document through the engine's
+    /// broadcast path — same fan-out as internally-emitted Documents
+    /// (static sinks + dynamic subscribers). Used by
+    /// `ZmqDocumentSource` and other Document-plane bridges to inject
+    /// a remote run into the local engine's subscriber chain without
+    /// being inside a plan.
+    pub async fn inject_document(&self, doc: &Document) -> Result<()> {
+        self.broadcast(doc).await
     }
 
     /// Register a custom command handler. Plans yielding
@@ -1240,6 +1261,7 @@ impl RunEngine {
                             .map(|d| d.as_nanos() as u64)
                             .unwrap_or_default(),
                         run_uid,
+                        exit_status: None,
                     };
                     hook(snap);
                 }
@@ -1611,7 +1633,25 @@ impl RunEngine {
                 .map(|bundler| bundler.compose().stop(exit_status, reason))
         };
         if let Some(stop) = stop_doc {
+            let run_uid = stop.run_start.clone();
             self.broadcast(&Document::Stop(stop)).await?;
+            // Crash-recovery audit: fire the checkpoint hook with
+            // `exit_status` set so a downstream JSONL store can
+            // pair the prior Checkpoint(s) for this run_uid with a
+            // clean close. The pairing is what
+            // `JsonlCheckpointStore::unfinished_run` uses to detect
+            // abandoned runs after a daemon restart.
+            if let Some(hook) = self.checkpoint_hook.lock().unwrap().clone() {
+                let snap = CheckpointSnapshot {
+                    timestamp_ns: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or_default(),
+                    run_uid: Some(run_uid),
+                    exit_status: Some(exit_status.to_string()),
+                };
+                hook(snap);
+            }
         }
         Ok(())
     }
