@@ -28,7 +28,7 @@ cirrus-host.workspace = true
 cirrus-backend-soft.workspace = true
 cirrus-stream = { workspace = true, optional = true }
 cirrus-protocols-async = { workspace = true, optional = true }
-epics-pva-rs = { version = "0.16.1", optional = true }
+epics-pva-rs = { version = "0.16.2", optional = true }
 bytes = { workspace = true, optional = true }
 
 [features]

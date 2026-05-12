@@ -27,5 +27,5 @@ cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
 cirrus-devices.workspace = true
 
-epics-ca-rs    = { version = "0.16.1", optional = true }
-epics-base-rs  = { version = "0.16.1", optional = true }
+epics-ca-rs    = { version = "0.16.2", optional = true }
+epics-base-rs  = { version = "0.16.2", optional = true }
