@@ -1217,6 +1217,12 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             Ok(())
         })?;
         lua.globals().set("ca_suspend_bool_low", f)?;
+
+        // areaDetector helper factories. Each `ad_*` global builds a
+        // prefix-rooted handle (e.g. `ad_cam("13SIM1:cam1:")`), blocks
+        // on the parallel-connect of every channel, and returns a
+        // UserData with synchronous (block_on-backed) method calls.
+        install_areadetector_factories(&lua)?;
     }
 
     // PVA-backed motor / detector factories — `pva` Cargo feature.
@@ -3439,6 +3445,305 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------
+// areaDetector Lua bindings (feature = "ca").
+// -----------------------------------------------------------------------
+
+/// Block on a cirrus async op from a Lua callback, formatting errors
+/// as Lua runtime errors. Lua callbacks always run on the REPL thread
+/// outside any tokio runtime, so `block_on` does not deadlock.
+#[cfg(feature = "ca")]
+fn ad_block<T, F>(what: &'static str, fut: F) -> mlua::Result<T>
+where
+    F: std::future::Future<Output = cirrus_core::error::Result<T>>,
+{
+    cirrus_core::runtime::cirrus_runtime()
+        .block_on(fut)
+        .map_err(|e| mlua::Error::RuntimeError(format!("{what}: {e}")))
+}
+
+/// Lua UserData wrapping `Arc<AreaDetectorCam>`.
+#[cfg(feature = "ca")]
+#[derive(Clone)]
+pub struct LuaAdCam(Arc<crate::areadetector::AreaDetectorCam>);
+
+#[cfg(feature = "ca")]
+impl UserData for LuaAdCam {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        use cirrus_protocols_async::SignalBackend;
+        m.add_method("prefix", |_, this, ()| Ok(this.0.prefix.clone()));
+        m.add_method("warmup", |_, this, ()| {
+            ad_block("ad_cam:warmup", this.0.warmup())
+        });
+        m.add_method("wait_for_idle", |_, this, secs: f64| {
+            ad_block(
+                "ad_cam:wait_for_idle",
+                this.0
+                    .wait_for_idle(std::time::Duration::from_secs_f64(secs)),
+            )
+        });
+        m.add_method("state", |_, this, ()| {
+            ad_block(
+                "ad_cam:state",
+                SignalBackend::<i64>::get_value(this.0.detector_state_rbv.as_ref()),
+            )
+        });
+        m.add_method("array_counter", |_, this, ()| {
+            ad_block(
+                "ad_cam:array_counter",
+                SignalBackend::<i64>::get_value(this.0.array_counter_rbv.as_ref()),
+            )
+        });
+        m.add_method("set_image_mode", |_, this, n: i64| {
+            ad_block("ad_cam:set_image_mode", async move {
+                let s = SignalBackend::<i64>::put(this.0.image_mode.as_ref(), n, true, None).await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+        m.add_method("set_num_images", |_, this, n: i64| {
+            ad_block("ad_cam:set_num_images", async move {
+                let s = SignalBackend::<i64>::put(this.0.num_images.as_ref(), n, true, None).await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+        m.add_method("set_acquire", |_, this, b: bool| {
+            ad_block("ad_cam:set_acquire", async move {
+                let s = SignalBackend::<bool>::put(this.0.acquire.as_ref(), b, false, None).await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+        m.add_method("set_acquire_time", |_, this, t: f64| {
+            ad_block("ad_cam:set_acquire_time", async move {
+                let s =
+                    SignalBackend::<f64>::put(this.0.acquire_time.as_ref(), t, true, None).await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+    }
+}
+
+/// Lua UserData wrapping `Arc<NdFile>`.
+#[cfg(feature = "ca")]
+#[derive(Clone)]
+pub struct LuaAdFile(Arc<crate::areadetector::NdFile>);
+
+#[cfg(feature = "ca")]
+impl UserData for LuaAdFile {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        m.add_method("prefix", |_, this, ()| Ok(this.0.plugin.prefix.clone()));
+        m.add_method("set_enabled", |_, this, b: bool| {
+            ad_block("ad_file:set_enabled", this.0.plugin.set_enabled(b))
+        });
+        m.add_method("set_blocking", |_, this, b: bool| {
+            ad_block("ad_file:set_blocking", this.0.plugin.set_blocking(b))
+        });
+        m.add_method("set_source_port", |_, this, port: String| {
+            ad_block(
+                "ad_file:set_source_port",
+                this.0.plugin.set_source_port(&port),
+            )
+        });
+        m.add_method("set_path", |_, this, p: String| {
+            ad_block("ad_file:set_path", this.0.set_path(&p))
+        });
+        m.add_method("set_name", |_, this, n: String| {
+            ad_block("ad_file:set_name", this.0.set_name(&n))
+        });
+        m.add_method("set_template", |_, this, t: String| {
+            ad_block("ad_file:set_template", this.0.set_template(&t))
+        });
+    }
+}
+
+/// Lua UserData wrapping `Arc<NdStats>`.
+#[cfg(feature = "ca")]
+#[derive(Clone)]
+pub struct LuaAdStats(Arc<crate::areadetector::NdStats>);
+
+#[cfg(feature = "ca")]
+impl UserData for LuaAdStats {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        use cirrus_protocols_async::SignalBackend;
+        m.add_method("prefix", |_, this, ()| Ok(this.0.plugin.prefix.clone()));
+        m.add_method("set_enabled", |_, this, b: bool| {
+            ad_block("ad_stats:set_enabled", this.0.plugin.set_enabled(b))
+        });
+        m.add_method("set_blocking", |_, this, b: bool| {
+            ad_block("ad_stats:set_blocking", this.0.plugin.set_blocking(b))
+        });
+        m.add_method("set_source_port", |_, this, port: String| {
+            ad_block(
+                "ad_stats:set_source_port",
+                this.0.plugin.set_source_port(&port),
+            )
+        });
+        m.add_method("force_enable_stats", |_, this, ()| {
+            ad_block("ad_stats:force_enable_stats", this.0.force_enable_stats())
+        });
+        m.add_method("set_compute_centroid", |_, this, b: bool| {
+            ad_block("ad_stats:set_compute_centroid", async move {
+                let s = SignalBackend::<bool>::put(this.0.compute_centroid.as_ref(), b, true, None)
+                    .await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+        m.add_method("set_compute_profiles", |_, this, b: bool| {
+            ad_block("ad_stats:set_compute_profiles", async move {
+                let s = SignalBackend::<bool>::put(this.0.compute_profiles.as_ref(), b, true, None)
+                    .await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+        m.add_method("set_compute_histogram", |_, this, b: bool| {
+            ad_block("ad_stats:set_compute_histogram", async move {
+                let s =
+                    SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), b, true, None)
+                        .await;
+                s.await
+                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
+            })
+        });
+    }
+}
+
+/// Lua UserData wrapping `Arc<NdRoi>`.
+#[cfg(feature = "ca")]
+#[derive(Clone)]
+pub struct LuaAdRoi(Arc<crate::areadetector::NdRoi>);
+
+#[cfg(feature = "ca")]
+impl UserData for LuaAdRoi {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        m.add_method("prefix", |_, this, ()| Ok(this.0.plugin.prefix.clone()));
+        m.add_method("set_enabled", |_, this, b: bool| {
+            ad_block("ad_roi:set_enabled", this.0.plugin.set_enabled(b))
+        });
+        m.add_method("set_blocking", |_, this, b: bool| {
+            ad_block("ad_roi:set_blocking", this.0.plugin.set_blocking(b))
+        });
+        m.add_method("set_source_port", |_, this, port: String| {
+            ad_block(
+                "ad_roi:set_source_port",
+                this.0.plugin.set_source_port(&port),
+            )
+        });
+        m.add_method(
+            "set_bounds",
+            |_, this, (min_x, min_y, size_x, size_y): (i64, i64, i64, i64)| {
+                ad_block(
+                    "ad_roi:set_bounds",
+                    this.0.set_bounds(min_x, min_y, size_x, size_y),
+                )
+            },
+        );
+        m.add_method("set_enabled_xy", |_, this, (x, y): (bool, bool)| {
+            ad_block("ad_roi:set_enabled_xy", this.0.set_enabled_xy(x, y))
+        });
+    }
+}
+
+/// Install `ad_cam` / `ad_file` / `ad_stats` / `ad_roi` factories and
+/// the `select_save_plugin` / `num_rois` free functions as Lua
+/// globals. Factories block on connect (5 s default timeout) before
+/// returning so subsequent put/get on the handle never observe a
+/// dangling channel.
+#[cfg(feature = "ca")]
+fn install_areadetector_factories(lua: &Lua) -> mlua::Result<()> {
+    use crate::areadetector::{
+        num_rois as ad_num_rois_fn, select_save_plugin as ad_select_save_plugin_fn,
+        AreaDetectorCam, NdFile, NdRoi, NdStats,
+    };
+    use std::time::Duration;
+
+    let connect_timeout = Duration::from_secs(5);
+
+    let f = lua.create_function(move |_, prefix: String| {
+        let cam = Arc::new(AreaDetectorCam::new(prefix));
+        let cam_for_async = cam.clone();
+        cirrus_core::runtime::cirrus_runtime()
+            .block_on(async move { cam_for_async.connect(connect_timeout).await })
+            .map_err(|e| mlua::Error::RuntimeError(format!("ad_cam: connect: {e}")))?;
+        Ok(LuaAdCam(cam))
+    })?;
+    lua.globals().set("ad_cam", f)?;
+
+    let f = lua.create_function(move |_, prefix: String| {
+        let file = Arc::new(NdFile::new(prefix));
+        let file_for_async = file.clone();
+        cirrus_core::runtime::cirrus_runtime()
+            .block_on(async move { file_for_async.connect(connect_timeout).await })
+            .map_err(|e| mlua::Error::RuntimeError(format!("ad_file: connect: {e}")))?;
+        Ok(LuaAdFile(file))
+    })?;
+    lua.globals().set("ad_file", f)?;
+
+    let f = lua.create_function(move |_, prefix: String| {
+        let stats = Arc::new(NdStats::new(prefix));
+        let stats_for_async = stats.clone();
+        cirrus_core::runtime::cirrus_runtime()
+            .block_on(async move { stats_for_async.connect(connect_timeout).await })
+            .map_err(|e| mlua::Error::RuntimeError(format!("ad_stats: connect: {e}")))?;
+        Ok(LuaAdStats(stats))
+    })?;
+    lua.globals().set("ad_stats", f)?;
+
+    let f = lua.create_function(move |_, prefix: String| {
+        let roi = Arc::new(NdRoi::new(prefix));
+        let roi_for_async = roi.clone();
+        cirrus_core::runtime::cirrus_runtime()
+            .block_on(async move { roi_for_async.connect(connect_timeout).await })
+            .map_err(|e| mlua::Error::RuntimeError(format!("ad_roi: connect: {e}")))?;
+        Ok(LuaAdRoi(roi))
+    })?;
+    lua.globals().set("ad_roi", f)?;
+
+    // `select_save_plugin(file, source_port, {sibling1, sibling2, …})`.
+    // UserData values are passed as `mlua::AnyUserData`; we borrow them
+    // back to `&LuaAdFile` and clone out the inner `Arc` so the
+    // resulting `Vec<Arc<NdFile>>` outlives the borrow guards.
+    let f = lua.create_function(
+        |_, (file_ud, source_port, siblings_tbl): (mlua::AnyUserData, String, mlua::Table)| {
+            let file_ref = file_ud.borrow::<LuaAdFile>()?;
+            let file_arc = file_ref.0.clone();
+            drop(file_ref);
+            let mut siblings: Vec<Arc<crate::areadetector::NdFile>> = Vec::new();
+            for pair in siblings_tbl.pairs::<mlua::Value, mlua::AnyUserData>() {
+                let (_, ud) = pair?;
+                let r = ud.borrow::<LuaAdFile>()?;
+                siblings.push(r.0.clone());
+            }
+            let sib_refs: Vec<&crate::areadetector::NdFile> =
+                siblings.iter().map(|a| a.as_ref()).collect();
+            ad_block(
+                "select_save_plugin",
+                ad_select_save_plugin_fn(file_arc.as_ref(), &source_port, &sib_refs),
+            )
+        },
+    )?;
+    lua.globals().set("select_save_plugin", f)?;
+
+    // `num_rois({roi1, roi2, …}, n)` — enable first n, disable rest.
+    let f = lua.create_function(|_, (rois_tbl, n): (mlua::Table, usize)| {
+        let mut rois: Vec<Arc<crate::areadetector::NdRoi>> = Vec::new();
+        for pair in rois_tbl.pairs::<mlua::Value, mlua::AnyUserData>() {
+            let (_, ud) = pair?;
+            let r = ud.borrow::<LuaAdRoi>()?;
+            rois.push(r.0.clone());
+        }
+        let refs: Vec<&crate::areadetector::NdRoi> = rois.iter().map(|a| a.as_ref()).collect();
+        ad_block("num_rois", ad_num_rois_fn(&refs, n))
+    })?;
+    lua.globals().set("num_rois", f)?;
+
+    Ok(())
+}
+
 fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> LuaValue {
     use serde_json::Value as J;
     match v {
@@ -3477,5 +3782,55 @@ fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> LuaValue {
             }
             LuaValue::Table(t)
         }
+    }
+}
+
+#[cfg(all(test, feature = "ca"))]
+mod ad_lua_smoke {
+    //! Live-IOC smoke for the `ad_*` Lua factories. Marked
+    //! `#[ignore]`. Requires `epics-rs/examples/sim-detector` running.
+    //!
+    //!     cargo test -p cirrus-host --features ca \
+    //!         lua_env::ad_lua_smoke -- --ignored --nocapture
+    //!
+    //! Note: this is `#[test]` (not `#[tokio::test]`). The Lua
+    //! factories call `cirrus_runtime().block_on(...)` synchronously
+    //! from their closures; if we were inside a `#[tokio::test]`
+    //! runtime, that nested `block_on` would panic.
+
+    use super::*;
+    use cirrus_engine::RunEngine;
+
+    fn ad_prefix() -> String {
+        std::env::var("CIRRUS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
+    }
+
+    #[test]
+    #[ignore]
+    fn lua_ad_factories_smoke() {
+        let re = Arc::new(RunEngine::new(vec![]));
+        let lua = build_lua(re).expect("build_lua");
+        let prefix = ad_prefix();
+
+        // `cam:state()` must produce a numeric DetectorState_RBV.
+        // `cam:warmup()` must complete without raising. Final
+        // counter must be strictly greater than the pre-warmup
+        // counter — proves the round-trip Lua → Rust → CA → IOC
+        // works end-to-end.
+        let script = format!(
+            r#"
+local cam = ad_cam("{prefix}cam1:")
+local s0 = cam:state()
+local c0 = cam:array_counter()
+cam:warmup()
+local s1 = cam:state()
+local c1 = cam:array_counter()
+assert(s1 == 0, "post-warmup state should be Idle, got " .. tostring(s1))
+assert(c1 > c0, "warmup did not increment counter: " .. c0 .. " -> " .. c1)
+return {{ s0 = s0, s1 = s1, c0 = c0, c1 = c1 }}
+"#
+        );
+        let result: mlua::Value = lua.load(&script).eval().expect("lua exec");
+        eprintln!("lua_ad_factories_smoke result = {result:?}");
     }
 }

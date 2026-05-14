@@ -26,6 +26,8 @@
 //!   suspender installers (feature `ca`).
 
 #[cfg(feature = "ca")]
+pub mod areadetector;
+#[cfg(feature = "ca")]
 pub mod ca_devices;
 #[cfg(feature = "ca")]
 pub mod ca_suspender;
