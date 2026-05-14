@@ -78,6 +78,50 @@ fn pv_field_to_f64(p: &PvField) -> Option<f64> {
     }
 }
 
+fn pv_field_to_i64(p: &PvField) -> Option<i64> {
+    match p {
+        PvField::Scalar(s) => match s {
+            ScalarValue::Long(l) => Some(*l),
+            ScalarValue::Int(i) => Some(*i as i64),
+            ScalarValue::Short(s) => Some(*s as i64),
+            ScalarValue::Byte(b) => Some(*b as i64),
+            ScalarValue::UByte(b) => Some(*b as i64),
+            ScalarValue::UShort(s) => Some(*s as i64),
+            ScalarValue::UInt(u) => Some(*u as i64),
+            ScalarValue::ULong(u) => Some(*u as i64),
+            ScalarValue::Boolean(b) => Some(*b as i64),
+            ScalarValue::Float(f) => Some(*f as i64),
+            ScalarValue::Double(d) => Some(*d as i64),
+            _ => None,
+        },
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find(|(name, _)| name == "value")
+            .and_then(|(_, f)| pv_field_to_i64(f)),
+        _ => None,
+    }
+}
+
+fn pv_field_to_bool(p: &PvField) -> Option<bool> {
+    match p {
+        PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
+        _ => pv_field_to_i64(p).map(|i| i != 0),
+    }
+}
+
+fn pv_field_to_string(p: &PvField) -> Option<String> {
+    match p {
+        PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find(|(name, _)| name == "value")
+            .and_then(|(_, f)| pv_field_to_string(f)),
+        _ => None,
+    }
+}
+
 // NTScalar carries an optional `timeStamp` substructure with
 // `secondsPastEpoch` (Long) and `nanoseconds` (Int). Return the
 // composed `f64` epoch timestamp when both are present; None otherwise.
@@ -207,6 +251,301 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
                             }
                         };
                         cb(&f, ts);
+                    }
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("pva monitor on {pv}: {e}");
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("pva://{name}")
+    }
+}
+
+#[async_trait]
+impl SignalBackend<String> for EpicsPvaBackend<String> {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        self.client
+            .pvconnect(&self.pv)
+            .await
+            .map(|_| ())
+            .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
+    }
+    async fn put(&self, value: String, _wait: bool, _timeout: Option<Duration>) -> Status {
+        let f = PvField::Scalar(ScalarValue::String(value));
+        match self.client.pvput_pv_field(&self.pv, &f).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
+        }
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        Ok(DataKey {
+            source: format!("pva://{source}"),
+            dtype: Dtype::String,
+            shape: vec![],
+            dtype_numpy: Some("|S".into()),
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+        })
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        let s = pv_field_to_string(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not string: {f:?}")))?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(s),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<String> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        pv_field_to_string(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not string: {f:?}")))
+    }
+    async fn get_setpoint(&self) -> Result<String> {
+        SignalBackend::<String>::get_value(self).await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let client = self.client.clone();
+        let pv = self.pv.clone();
+        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let warned_local_clock = Arc::new(AtomicBool::new(false));
+        let pv_for_cb = pv.clone();
+        let warned_for_cb = warned_local_clock.clone();
+        let handle = tokio::spawn(async move {
+            let res = client
+                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
+                    if let Some(s) = pv_field_to_string(field) {
+                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
+                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
+                                tracing::warn!(
+                                    target: "cirrus_backend_epics_pva",
+                                    "pva {}: monitor frame has no server timeStamp; \
+                                     falling back to local clock for this PV (one-shot)",
+                                    pv_for_cb,
+                                );
+                            }
+                            now_ts()
+                        });
+                        cb(&s, ts);
+                    }
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("pva monitor on {pv}: {e}");
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("pva://{name}")
+    }
+}
+
+#[async_trait]
+impl SignalBackend<i64> for EpicsPvaBackend<i64> {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        self.client
+            .pvconnect(&self.pv)
+            .await
+            .map(|_| ())
+            .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
+    }
+    async fn put(&self, value: i64, _wait: bool, _timeout: Option<Duration>) -> Status {
+        let f = PvField::Scalar(ScalarValue::Long(value));
+        match self.client.pvput_pv_field(&self.pv, &f).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
+        }
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        Ok(DataKey {
+            source: format!("pva://{source}"),
+            dtype: Dtype::Integer,
+            shape: vec![],
+            dtype_numpy: Some("<i8".into()),
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+        })
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        let i = pv_field_to_i64(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not int: {f:?}")))?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(i),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<i64> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        pv_field_to_i64(&f).ok_or_else(|| CirrusError::Backend(format!("pva: not int: {f:?}")))
+    }
+    async fn get_setpoint(&self) -> Result<i64> {
+        SignalBackend::<i64>::get_value(self).await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<i64>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let client = self.client.clone();
+        let pv = self.pv.clone();
+        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let warned_local_clock = Arc::new(AtomicBool::new(false));
+        let pv_for_cb = pv.clone();
+        let warned_for_cb = warned_local_clock.clone();
+        let handle = tokio::spawn(async move {
+            let res = client
+                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
+                    if let Some(i) = pv_field_to_i64(field) {
+                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
+                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
+                                tracing::warn!(
+                                    target: "cirrus_backend_epics_pva",
+                                    "pva {}: monitor frame has no server timeStamp; \
+                                     falling back to local clock for this PV (one-shot)",
+                                    pv_for_cb,
+                                );
+                            }
+                            now_ts()
+                        });
+                        cb(&i, ts);
+                    }
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("pva monitor on {pv}: {e}");
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("pva://{name}")
+    }
+}
+
+#[async_trait]
+impl SignalBackend<bool> for EpicsPvaBackend<bool> {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        self.client
+            .pvconnect(&self.pv)
+            .await
+            .map(|_| ())
+            .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
+    }
+    async fn put(&self, value: bool, _wait: bool, _timeout: Option<Duration>) -> Status {
+        let f = PvField::Scalar(ScalarValue::Boolean(value));
+        match self.client.pvput_pv_field(&self.pv, &f).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
+        }
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        Ok(DataKey {
+            source: format!("pva://{source}"),
+            dtype: Dtype::Boolean,
+            shape: vec![],
+            dtype_numpy: Some("|b1".into()),
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+        })
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        let b = pv_field_to_bool(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not bool: {f:?}")))?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(b),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<bool> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        pv_field_to_bool(&f).ok_or_else(|| CirrusError::Backend(format!("pva: not bool: {f:?}")))
+    }
+    async fn get_setpoint(&self) -> Result<bool> {
+        SignalBackend::<bool>::get_value(self).await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<bool>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let client = self.client.clone();
+        let pv = self.pv.clone();
+        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let warned_local_clock = Arc::new(AtomicBool::new(false));
+        let pv_for_cb = pv.clone();
+        let warned_for_cb = warned_local_clock.clone();
+        let handle = tokio::spawn(async move {
+            let res = client
+                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
+                    if let Some(b) = pv_field_to_bool(field) {
+                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
+                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
+                                tracing::warn!(
+                                    target: "cirrus_backend_epics_pva",
+                                    "pva {}: monitor frame has no server timeStamp; \
+                                     falling back to local clock for this PV (one-shot)",
+                                    pv_for_cb,
+                                );
+                            }
+                            now_ts()
+                        });
+                        cb(&b, ts);
                     }
                 })
                 .await;
